@@ -177,6 +177,8 @@ _models: dict = {}
 # ---------------------------------------------------------------------------
 _shutting_down: bool = False
 SHUTDOWN_TIMEOUT = int(os.environ.get("SHUTDOWN_TIMEOUT", "30"))
+# Alert (WARNING log) when draining takes longer than this; see chaos-mesh/README.md.
+SHUTDOWN_DRAIN_BUDGET_S = float(os.environ.get("SHUTDOWN_DRAIN_BUDGET_S", "25"))
 _inflight_requests: int = 0
 _inflight_lock = __import__("threading").Lock()
 
@@ -260,7 +262,8 @@ async def _lifespan(application: FastAPI):
     logger.info("[shutdown] Stopping new requests (returning 503)")
 
     # Wait for in-flight requests to drain
-    deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+    drain_start = time.monotonic()
+    deadline = drain_start + SHUTDOWN_TIMEOUT
     while time.monotonic() < deadline:
         with _inflight_lock:
             count = _inflight_requests
@@ -273,6 +276,14 @@ async def _lifespan(application: FastAPI):
             count = _inflight_requests
         if count > 0:
             logger.warning("[shutdown] Timed out with %d in-flight requests", count)
+    drain_s = time.monotonic() - drain_start
+    logger.info("[shutdown] drain_seconds=%.2f", drain_s)
+    if drain_s > SHUTDOWN_DRAIN_BUDGET_S:
+        logger.warning(
+            "[shutdown] ALERT drain time %.2fs exceeded budget %.2fs",
+            drain_s,
+            SHUTDOWN_DRAIN_BUDGET_S,
+        )
 
     # Close WebSocket connections
     from api.ws_router import manager as _ws_manager

@@ -1,35 +1,51 @@
-"""Post-experiment recovery check for chaos-mesh experiments.
+"""SLO-based pass/fail verification for chaos-mesh experiments.
 
 Usage
 -----
-    python chaos-mesh/verify_experiment.py --health-url https://ledgerlens.staging.example/health
+    python chaos-mesh/verify_experiment.py --experiment pod-kill-api.yaml \
+        --url https://ledgerlens.staging.example
 
     # Local default (http://localhost:8000/health), e.g. against a port-forward
     python chaos-mesh/verify_experiment.py
 
-    # Environment variable instead of the flag
+    # Environment variables instead of flags
+    CHAOS_EXPERIMENT=network-partition-redis.yaml \
     HEALTH_URL=https://ledgerlens.staging.example/health python chaos-mesh/verify_experiment.py
 
 Workflow
     This script is the "verify" step of the chaos-testing loop:
-    apply an experiment YAML in this directory (deploy) -> watch the system
-    while the fault is injected (observe) -> run this script once the
-    experiment's ``duration`` has elapsed (verify).  It polls ``GET /health``
-    every 2s until the endpoint returns HTTP 200 with ``{"status": "ok"}`` or
-    ``--timeout`` seconds (default 60, ``HEALTH_TIMEOUT_S``) pass.
+    apply an experiment YAML in this directory (deploy), then run this script
+    straight away.  It drives sustained traffic at the API for the experiment's
+    traffic window while polling ``GET /health`` every 2s, then asserts the
+    experiment's SLOs (see ``EXPERIMENT_SLOS`` and ``chaos-mesh/README.md``):
 
-    Connection errors during polling are expected while the fault is active and
-    are logged at DEBUG (use ``-v`` to see them); only a failure to recover
-    before the timeout is treated as an error.
+    * recovery   — ``/health`` returns 200 ``{"status": "ok"}`` within
+                   ``recovery_s`` seconds;
+    * error rate — the share of traffic requests that did not succeed stays at
+                   or below ``max_error_rate``;
+    * dropped    — requests silently dropped mid-flight (connection reset,
+                   read timeout, non-retriable 5xx) stay at or below
+                   ``max_dropped`` (0 for the API pod-kill: every request must
+                   either complete or get a retriable error);
+    * drain time — the slowest request that completed during the window
+                   (i.e. was drained rather than dropped) stays within
+                   ``drain_budget_s``. Exceeding it logs an ``ALERT`` line and,
+                   when ``--alert-webhook`` is set, POSTs a JSON alert.
+
+    Connection errors during health polling are expected while the fault is
+    active and are logged at DEBUG (use ``-v`` to see them).
 
 Exit codes
-    0  the health endpoint recovered within the timeout
-    1  the health endpoint did not recover in time
+    0  every SLO for the experiment was met
+    1  at least one SLO was violated (each violation is printed)
 """
 import argparse
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 import requests
 
@@ -43,17 +59,106 @@ DEFAULT_METRICS_URL = "http://localhost:8000/metrics"
 HEALTH_URL = os.environ.get("HEALTH_URL", DEFAULT_HEALTH_URL)
 METRICS_URL = os.environ.get("METRICS_URL", DEFAULT_METRICS_URL)
 
+# Status codes a well-behaved client retries (the API sets Retry-After on 503).
+RETRIABLE_STATUS = {429, 502, 503, 504}
 
-def assert_recovery(health_url: str, timeout_s: int = 60) -> None:
-    """Poll GET /health until status == 'ok' or timeout_s elapses; raise on timeout."""
-    deadline = time.time() + timeout_s
+
+@dataclass(frozen=True)
+class SLO:
+    recovery_s: int
+    max_error_rate: float
+    max_dropped: int
+    drain_budget_s: float
+    traffic_s: int = 60
+
+
+# Per-experiment pass/fail criteria. Keep in sync with chaos-mesh/README.md.
+EXPERIMENT_SLOS: dict[str, SLO] = {
+    "pod-kill-api.yaml": SLO(recovery_s=60, max_error_rate=0.05, max_dropped=0, drain_budget_s=30),
+    "pod-kill-ingestion.yaml": SLO(recovery_s=90, max_error_rate=0.01, max_dropped=0, drain_budget_s=30),
+    "network-partition-ingestion.yaml": SLO(
+        recovery_s=60, max_error_rate=0.05, max_dropped=0, drain_budget_s=10, traffic_s=90
+    ),
+    "network-partition-redis.yaml": SLO(
+        recovery_s=60, max_error_rate=0.02, max_dropped=0, drain_budget_s=10, traffic_s=90
+    ),
+}
+DEFAULT_EXPERIMENT = "pod-kill-api.yaml"
+
+
+@dataclass
+class TrafficResult:
+    ok: int = 0
+    retriable: int = 0
+    dropped: int = 0
+    max_ok_latency_s: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def total(self) -> int:
+        return self.ok + self.retriable + self.dropped
+
+    @property
+    def error_rate(self) -> float:
+        return (self.retriable + self.dropped) / self.total if self.total else 0.0
+
+
+def classify(resp: requests.Response | None, exc: Exception | None) -> str:
+    """Return ``ok``, ``retriable`` or ``dropped`` for one traffic request."""
+    if exc is None and resp is not None:
+        if resp.status_code < 400:
+            return "ok"
+        return "retriable" if resp.status_code in RETRIABLE_STATUS else "dropped"
+    # Connection refused before the request was sent is safe to retry; a reset
+    # or timeout after sending means the response was silently lost.
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "retriable"
+    if isinstance(exc, requests.exceptions.ConnectionError) and "NewConnectionError" in repr(exc):
+        return "retriable"
+    return "dropped"
+
+
+def run_traffic(url: str, duration_s: float, workers: int = 4) -> TrafficResult:
+    """Send sustained GET traffic at *url* for *duration_s* and classify every request."""
+    result = TrafficResult()
+    deadline = time.monotonic() + duration_s
+
+    def worker() -> None:
+        session = requests.Session()
+        while time.monotonic() < deadline:
+            t0 = time.monotonic()
+            resp, exc = None, None
+            try:
+                resp = session.get(url, timeout=(3, 35))
+            except Exception as e:  # noqa: BLE001 — every failure is classified
+                exc = e
+            kind = classify(resp, exc)
+            elapsed = time.monotonic() - t0
+            with result.lock:
+                setattr(result, kind, getattr(result, kind) + 1)
+                if kind == "ok":
+                    result.max_ok_latency_s = max(result.max_ok_latency_s, elapsed)
+            if kind == "dropped":
+                logger.warning("dropped request: %r", exc or resp.status_code)
+            time.sleep(0.1)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for _ in range(workers):
+            pool.submit(worker)
+    return result
+
+
+def assert_recovery(health_url: str, timeout_s: int = 60) -> float:
+    """Poll GET /health until status == 'ok'; return seconds taken, raise on timeout."""
+    start = time.time()
+    deadline = start + timeout_s
     attempt = 0
     while time.time() < deadline:
         attempt += 1
         try:
             resp = requests.get(health_url, timeout=5)
             if resp.status_code == 200 and resp.json().get("status") == "ok":
-                return
+                return time.time() - start
             logger.debug(
                 "health check attempt %d: not ready yet (status_code=%s, body=%.200r)",
                 attempt,
@@ -75,26 +180,96 @@ def assert_recovery(health_url: str, timeout_s: int = 60) -> None:
     raise RuntimeError(f"Health endpoint did not recover within {timeout_s}s")
 
 
+def evaluate(slo: SLO, recovery_s: float | None, traffic: TrafficResult | None) -> list[str]:
+    """Return a list of human-readable SLO violations (empty when all pass)."""
+    violations = []
+    if recovery_s is None or recovery_s > slo.recovery_s:
+        violations.append(f"recovery: did not recover within {slo.recovery_s}s")
+    if traffic is not None:
+        if traffic.total == 0:
+            violations.append("traffic: no requests were sent")
+        if traffic.error_rate > slo.max_error_rate:
+            violations.append(
+                f"error rate: {traffic.error_rate:.2%} > ceiling {slo.max_error_rate:.2%}"
+            )
+        if traffic.dropped > slo.max_dropped:
+            violations.append(
+                f"dropped: {traffic.dropped} request(s) silently dropped > {slo.max_dropped}"
+            )
+        if traffic.max_ok_latency_s > slo.drain_budget_s:
+            violations.append(
+                f"drain time: {traffic.max_ok_latency_s:.1f}s > budget {slo.drain_budget_s:.1f}s"
+            )
+    return violations
+
+
+def send_alert(webhook: str | None, experiment: str, violations: list[str]) -> None:
+    for v in violations:
+        if v.startswith("drain time"):
+            logger.error("ALERT chaos drain budget exceeded (%s): %s", experiment, v)
+            if webhook:
+                try:
+                    requests.post(
+                        webhook,
+                        json={"alert": "ChaosDrainBudgetExceeded", "experiment": experiment, "detail": v},
+                        timeout=5,
+                    )
+                except Exception as exc:
+                    logger.warning("alert webhook failed: %s", exc)
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify that a LedgerLens deployment recovers after a chaos-mesh "
-            "experiment by polling its /health endpoint."
+            "Verify that a LedgerLens deployment meets its SLOs during and after "
+            "a chaos-mesh experiment."
         )
     )
     parser.add_argument(
+        "--experiment",
+        default=os.environ.get("CHAOS_EXPERIMENT", DEFAULT_EXPERIMENT),
+        choices=sorted(EXPERIMENT_SLOS),
+        help=f"Experiment file whose SLOs to assert (default: {DEFAULT_EXPERIMENT}).",
+    )
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="API base URL; sets --health-url to <url>/health when that is not given.",
+    )
+    parser.add_argument(
         "--health-url",
-        default=os.environ.get("HEALTH_URL", DEFAULT_HEALTH_URL),
+        default=os.environ.get("HEALTH_URL"),
         help=(
             "Health-check URL to poll. Falls back to the HEALTH_URL environment "
             f"variable, then to {DEFAULT_HEALTH_URL}."
         ),
     )
     parser.add_argument(
+        "--metrics-url",
+        default=os.environ.get("METRICS_URL", DEFAULT_METRICS_URL),
+        help="Metrics URL (accepted for workflow compatibility; logged for reference).",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
-        default=int(os.environ.get("HEALTH_TIMEOUT_S", "60")),
-        help="Seconds to keep polling before declaring the recovery failed (default: 60).",
+        default=int(os.environ["HEALTH_TIMEOUT_S"]) if "HEALTH_TIMEOUT_S" in os.environ else None,
+        help="Override the experiment's recovery SLO in seconds.",
+    )
+    parser.add_argument(
+        "--traffic-url",
+        default=os.environ.get("TRAFFIC_URL"),
+        help="URL to send sustained traffic to (default: the health URL).",
+    )
+    parser.add_argument(
+        "--traffic-seconds",
+        type=int,
+        default=None,
+        help="Override the sustained-traffic window (0 disables traffic assertions).",
+    )
+    parser.add_argument(
+        "--alert-webhook",
+        default=os.environ.get("CHAOS_ALERT_WEBHOOK"),
+        help="Optional URL to POST a JSON alert to when the drain budget is exceeded.",
     )
     parser.add_argument(
         "-v",
@@ -102,20 +277,48 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging (shows each failed health-check attempt).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.health_url:
+        args.health_url = f"{args.url.rstrip('/')}/health" if args.url else DEFAULT_HEALTH_URL
+    args.traffic_url = args.traffic_url or args.health_url
+    return args
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    try:
-        assert_recovery(args.health_url, timeout_s=args.timeout)
-        print(f"✅ Health recovered ({args.health_url})")
-        return 0
-    except Exception as e:
-        print(f"❌ Recovery failed: {e}")
+    slo = EXPERIMENT_SLOS[args.experiment]
+    if args.timeout is not None:
+        slo = SLO(args.timeout, slo.max_error_rate, slo.max_dropped, slo.drain_budget_s, slo.traffic_s)
+    traffic_s = slo.traffic_s if args.traffic_seconds is None else args.traffic_seconds
+    logger.info("Verifying %s against %s (metrics: %s)", args.experiment, args.health_url, args.metrics_url)
+
+    traffic: TrafficResult | None = None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(run_traffic, args.traffic_url, traffic_s) if traffic_s > 0 else None
+        try:
+            recovery_s = assert_recovery(args.health_url, timeout_s=slo.recovery_s)
+        except Exception as e:
+            logger.error("Recovery failed: %s", e)
+            recovery_s = None
+        if future is not None:
+            traffic = future.result()
+
+    if traffic is not None:
+        print(
+            f"traffic: total={traffic.total} ok={traffic.ok} retriable={traffic.retriable} "
+            f"dropped={traffic.dropped} error_rate={traffic.error_rate:.2%} "
+            f"drain={traffic.max_ok_latency_s:.1f}s"
+        )
+    violations = evaluate(slo, recovery_s, traffic)
+    if violations:
+        send_alert(args.alert_webhook, args.experiment, violations)
+        for v in violations:
+            print(f"❌ SLO violated — {v}")
         return 1
+    print(f"✅ All SLOs met for {args.experiment} ({args.health_url})")
+    return 0
 
 
 if __name__ == "__main__":
