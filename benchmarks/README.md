@@ -193,3 +193,44 @@ so compare like-for-like.
 
 Local-only. Not referenced by any workflow in `.github/workflows/` or by the
 `Makefile`.
+
+---
+
+## Feature-store regression gate
+
+`tests/benchmark_feature_store.py --gate` is a CI-enforced performance gate
+for the streaming feature store (`.github/workflows/feature-store-benchmark.yml`,
+runs on pushes to `main` and on PRs touching the feature store).
+
+- **Metric**: median (of 5 runs) time for the incremental path
+  (`update_feature_state` + `derive_feature_vector`) over a deterministic
+  synthetic history for 100 wallets.
+- **Baseline**: median of the last 5 results recorded on `main`.
+- **Threshold**: the job fails if the current run is more than **25%** slower
+  than the baseline. Only `main` runs are recorded, so PRs are always compared
+  with the `main` baseline and cannot move it.
+- **History**: `benchmarks/results/feature_store_history.json`, persisted in
+  the Actions cache and uploaded as the `feature-store-benchmark-history`
+  artifact on every run.
+- **Trend**: each run writes a trend chart of the last 20 recorded results to
+  the job summary (open the workflow run → *Summary*).
+
+Run locally:
+
+```bash
+python -m tests.benchmark_feature_store --gate --history /tmp/fs_history.json --record
+```
+
+### Responding to a regression failure
+
+1. Open the job summary: compare the current value with the trend to confirm
+   the slowdown is outside normal variance (runner noise is usually <10%).
+2. Re-run the job once. A one-off failure that passes on re-run is runner
+   noise; a repeated failure is a real regression.
+3. Reproduce locally by running the gate on `main` and on your branch against
+   the same history file, then profile the incremental path
+   (`python -m cProfile -m tests.benchmark_feature_store`).
+4. Fix the regression. If the slowdown is an intentional trade-off (e.g. a new
+   feature), say so in the PR description and get a maintainer's approval to
+   merge despite the red check. `main` records every run, so the new level
+   becomes the rolling baseline after three further `main` runs.
