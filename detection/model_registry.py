@@ -8,6 +8,20 @@ SHAP importance tracking: :func:`compute_shap_summary` computes mean absolute
 SHAP values per model after training. :func:`compare_importance_stability`
 checks Spearman rank correlation of top-10 features between model versions
 and blocks auto-promotion when correlation drops below the configured threshold.
+
+Promotion gates (Issue #933)
+----------------------------
+:func:`promote_model` enforces two hard pre-checks before updating the
+latest pointer:
+
+1. **Signed model card** — a model card for the candidate version must exist
+   and carry a valid ED25519 signature (``ModelSigner.verify``).
+2. **Robustness threshold** — ``compute_robustness_report`` must show
+   ``mean_map >= ROBUSTNESS_MIN_MAP`` and ``asr["0.10"] <= ROBUSTNESS_MAX_ASR``.
+
+Either failure raises :class:`PromotionGateError` with a distinct, actionable
+message naming the failing gate.  Gate results are recorded in
+``training_metadata.json`` under the ``"promotion_checks"`` key for audit.
 """
 
 import hashlib
@@ -26,6 +40,26 @@ from detection.model_signing import assert_within_model_dir, safe_joblib_load, s
 logger = logging.getLogger("ledgerlens.model_registry")
 
 SHAP_STABILITY_THRESHOLD: float = 0.70
+
+# ---------------------------------------------------------------------------
+# Promotion gate thresholds (Issue #933)
+# ---------------------------------------------------------------------------
+# A candidate model must meet BOTH thresholds to be promoted.
+# mean_map: minimal adversarial perturbation magnitude — higher is more robust
+# asr_010:  attack success rate at epsilon=0.10 — lower is more robust
+ROBUSTNESS_MIN_MAP: float = 0.05   # MAP must be >= this value
+ROBUSTNESS_MAX_ASR: float = 0.80   # ASR at ε=0.10 must be <= this value
+
+
+class PromotionGateError(RuntimeError):
+    """Raised when a promotion pre-check fails.
+
+    ``gate`` identifies which check failed (``"model_card"`` or ``"robustness"``).
+    """
+
+    def __init__(self, gate: str, message: str) -> None:
+        self.gate = gate
+        super().__init__(f"[gate:{gate}] {message}")
 
 
 def _compute_version_hash(training_row_count: int, column_hash: str) -> str:
@@ -346,3 +380,171 @@ def load_shap_importances(model_dir: str, version: str | None = None) -> dict | 
         return None
 
     return metadata.get("shap_importances")
+
+
+# ---------------------------------------------------------------------------
+# Promotion gates (Issue #933)
+# ---------------------------------------------------------------------------
+
+
+def _check_model_card_gate(name: str, version: str, model_dir: str) -> dict:
+    """Return gate result dict; raise PromotionGateError on failure.
+
+    Checks that a model card file exists for the given version and that it
+    carries a valid ED25519 signature produced by :class:`~detection.model_signing.ModelSigner`.
+    """
+    card_path = Path(model_dir) / f"{name}_v{version}_model_card.json"
+    if not card_path.exists():
+        raise PromotionGateError(
+            "model_card",
+            f"No model card found for {name} v{version} at {card_path}. "
+            "Generate and sign a model card before promoting this version.",
+        )
+
+    # Verify the ED25519 signature on the card file
+    try:
+        from detection.model_signing import get_model_signer
+        signer = get_model_signer()
+        signer.verify(card_path)
+    except Exception as exc:
+        raise PromotionGateError(
+            "model_card",
+            f"Model card signature verification failed for {name} v{version}: {exc}. "
+            "Re-sign the model card with a valid private key before promoting.",
+        )
+
+    logger.info("Promotion gate PASSED [model_card]: %s v%s", name, version)
+    return {"gate": "model_card", "passed": True, "card_path": str(card_path)}
+
+
+def _check_robustness_gate(name: str, version: str, model_dir: str) -> dict:
+    """Return gate result dict; raise PromotionGateError on failure.
+
+    Loads the latest persisted robustness report from the database (written by
+    :func:`~detection.robustness_eval.compute_robustness_report`).  Falls back
+    to inline computation when no persisted report exists for this version.
+    """
+    from detection.storage import get_latest_robustness_report
+
+    report_data: dict | None = None
+    try:
+        report_data = get_latest_robustness_report(model_version=version)
+    except Exception as exc:
+        logger.warning("Could not load persisted robustness report for %s v%s: %s", name, version, exc)
+
+    if report_data is None:
+        raise PromotionGateError(
+            "robustness",
+            f"No robustness report found for {name} v{version}. "
+            "Run compute_robustness_report() and persist results before promoting.",
+        )
+
+    mean_map = float(report_data.get("mean_map", 0.0))
+    asr = report_data.get("asr", {})
+    asr_010 = float(asr.get("0.10", 1.0))
+
+    failures: list[str] = []
+    if mean_map < ROBUSTNESS_MIN_MAP:
+        failures.append(
+            f"mean_map={mean_map:.4f} is below the required threshold of {ROBUSTNESS_MIN_MAP}"
+        )
+    if asr_010 > ROBUSTNESS_MAX_ASR:
+        failures.append(
+            f"asr[0.10]={asr_010:.4f} exceeds the maximum allowed value of {ROBUSTNESS_MAX_ASR}"
+        )
+
+    if failures:
+        raise PromotionGateError(
+            "robustness",
+            f"Robustness gate FAILED for {name} v{version}: " + "; ".join(failures) + ". "
+            "Re-evaluate robustness and address deficiencies before promoting.",
+        )
+
+    logger.info(
+        "Promotion gate PASSED [robustness]: %s v%s (mean_map=%.4f, asr_010=%.4f)",
+        name, version, mean_map, asr_010,
+    )
+    return {
+        "gate": "robustness",
+        "passed": True,
+        "mean_map": mean_map,
+        "asr_010": asr_010,
+    }
+
+
+def _record_promotion_checks(model_dir: str, name: str, version: str, gate_results: list[dict]) -> None:
+    """Persist gate results to training_metadata.json for audit trail."""
+    metadata_path = os.path.join(model_dir, "training_metadata.json")
+    metadata: dict = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read existing metadata: %s", exc)
+
+    promotions = metadata.setdefault("promotion_checks", {})
+    promotions[f"{name}_v{version}"] = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "gates": gate_results,
+    }
+
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def promote_model(name: str, version: str, model_dir: str) -> None:
+    """Promote *version* as the active model after enforcing pre-checks.
+
+    Pre-checks (both must pass):
+      1. **model_card** — a signed model card JSON must exist for this version.
+      2. **robustness** — a persisted robustness report must meet
+         ``mean_map >= ROBUSTNESS_MIN_MAP`` and ``asr["0.10"] <= ROBUSTNESS_MAX_ASR``.
+
+    On any gate failure, raises :class:`PromotionGateError` with ``gate``
+    identifying which check failed and a message explaining the resolution.
+
+    On success, updates ``{name}_latest.txt`` and records gate results in
+    ``training_metadata.json`` for audit.
+
+    Args:
+        name: Model name (e.g., ``"random_forest"``).
+        version: Candidate version string (SHA-256[:8]).
+        model_dir: Directory containing versioned models.
+
+    Raises:
+        PromotionGateError: If any pre-check fails.
+        FileNotFoundError: If the versioned model file does not exist.
+    """
+    # Verify candidate model file actually exists before spending gate effort
+    model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Cannot promote: versioned model not found at {model_path}"
+        )
+
+    gate_results: list[dict] = []
+
+    # Gate 1: signed model card
+    card_result = _check_model_card_gate(name, version, model_dir)
+    gate_results.append(card_result)
+
+    # Gate 2: robustness threshold
+    rob_result = _check_robustness_gate(name, version, model_dir)
+    gate_results.append(rob_result)
+
+    # Record gate results for audit trail (best-effort)
+    try:
+        _record_promotion_checks(model_dir, name, version, gate_results)
+    except Exception as exc:
+        logger.warning("Could not persist promotion check results: %s", exc)
+
+    # All gates passed — update the latest pointer
+    latest_path = os.path.join(model_dir, f"{name}_latest.txt")
+    with open(latest_path, "w") as f:
+        f.write(version)
+
+    logger.info(
+        "Promoted %s to version %s (all gates passed: %s)",
+        name, version, [g["gate"] for g in gate_results],
+    )

@@ -21,7 +21,7 @@ import config.settings as settings_module
 from detection.benford_engine import BenfordStreamCounter
 from detection.feature_engineering import FEATURE_NAMES
 from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
-from detection.model_signing import assert_within_model_dir, safe_joblib_load
+from detection.model_signing import assert_within_model_dir, safe_joblib_load, verify_sigstore_attestation
 from detection.adversarial_features import apply_adversarial_boost
 
 logger = logging.getLogger("ledgerlens.model_inference")
@@ -175,6 +175,9 @@ def _load_models_base(model_dir: str | None = None) -> dict:
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             assert_within_model_dir(path, model_dir)
+            # Issue #934: verify Sigstore attestation before loading any model artifact.
+            # Raises SigstoreAttestationError if the bundle is missing or invalid.
+            verify_sigstore_attestation(path)
             models[name] = safe_joblib_load(path, signing_key)
 
     gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
@@ -190,6 +193,7 @@ def _load_models_base(model_dir: str | None = None) -> dict:
     if os.path.exists(meta_path):
         try:
             assert_within_model_dir(meta_path, model_dir)
+            verify_sigstore_attestation(meta_path)
             models["meta_learner"] = safe_joblib_load(meta_path, signing_key)
         except Exception as exc:
             logger.warning("Failed to load meta_learner.joblib: %s — using equal-weight averaging", exc)

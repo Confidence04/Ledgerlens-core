@@ -8,6 +8,26 @@ data contract.
 Starting from v2, the schema includes optional uncertainty fields
 (``score_lower``, ``score_upper``, ``prediction_set``, ``coverage_guarantee``)
 populated by ``ConformalCalibrator`` during inference.
+
+Starting from v3, the schema includes a ``score_version`` field that pins the
+aggregation formula semantics.  Downstream consumers (API, SDKs, on-chain
+publisher) MUST propagate this field unchanged.  A change to the aggregation
+formula REQUIRES a version bump — enforced by the golden-file regression test
+at ``tests/test_score_version_contract.py``.
+
+Versioned aggregation contract
+-------------------------------
+``SCORE_VERSION = "3"``
+
+Formula (weights are the stable contract):
+  base_component   = 0.3 * benford_component + 0.7 * ml_component
+  sandwich_blend   = (1 - sandwich_weight) * base + sandwich_weight * sandwich_component
+  copula_blend     = (1 - copula_weight)   * sandwich_blend + copula_weight * copula_component
+  causal_adjust    = pdc_score * pdc_discount_weight  (subtracted from copula_blend)
+  final_score      = clamp(copula_blend - causal_adjust, 0, 100)
+
+Any change to these weights, operations, or clamp bounds MUST increment
+``SCORE_VERSION`` and regenerate ``tests/score_version_golden.json``.
 """
 
 from __future__ import annotations
@@ -15,6 +35,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Aggregation contract version
+# ---------------------------------------------------------------------------
+# Bump this constant (and regenerate tests/score_version_golden.json) whenever
+# the aggregation formula, weights, clamp bounds, or field semantics change.
+SCORE_VERSION: str = "3"
 
 
 class RiskScore(BaseModel):
@@ -26,6 +53,13 @@ class RiskScore(BaseModel):
     confidence: int = Field(ge=0, le=100)
     disputed: bool = False
     timestamp: datetime
+
+    # Aggregation contract version — propagate unchanged through API responses
+    # and on-chain publications.  See module docstring for the versioned spec.
+    score_version: str = Field(
+        default=SCORE_VERSION,
+        description="Aggregation formula version; bump on any formula change",
+    )
 
     # Streaming latency field (optional, populated on the streaming path)
     latency_ms: float | None = Field(
@@ -80,6 +114,9 @@ class RiskScore(BaseModel):
         Optional uncertainty fields (``score_lower``, ``score_upper``,
         ``prediction_set``, ``coverage_guarantee``) are passed through to
         the returned ``RiskScore`` when provided.
+
+        The exact formula is the versioned contract documented in the module
+        docstring.  Do not change weights without bumping ``SCORE_VERSION``.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -107,6 +144,7 @@ class RiskScore(BaseModel):
             ml_flag=ml_flag,
             confidence=round(ml_confidence * 100),
             timestamp=datetime.now(timezone.utc),
+            score_version=SCORE_VERSION,
             score_lower=score_lower,
             score_upper=score_upper,
             prediction_set=prediction_set,
@@ -131,4 +169,3 @@ def temporal_risk_adjustment(
     snapshot_weight = 1.0 - temporal_weight
     final_score = snapshot_weight * snapshot_score + temporal_weight * (temporal_score * 100.0)
     return max(0, min(100, round(final_score)))
-
