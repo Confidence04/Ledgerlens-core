@@ -32,7 +32,11 @@ from detection.feature_store import FeatureStore
 from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
 from detection.path_cycle_detector import detect_cycles_from_payments, path_payment_cycles_to_alerts
-from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.path_payment_engine import (
+    detect_atomic_circular_routes,
+    detect_path_payment_sandwiches,
+    path_payment_sandwiches_to_alerts,
+)
 from detection.event_bus import get_event_bus
 from detection.risk_score import RiskScore
 from detection.storage import (
@@ -344,6 +348,11 @@ def run(
 
             path_payments = load_path_payments_for_accounts(list(accounts), since)
             save_path_payments(path_payments)
+            save_alerts(
+                path_payment_sandwiches_to_alerts(
+                    detect_path_payment_sandwiches(path_payments)
+                )
+            )
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
             path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
@@ -575,6 +584,11 @@ async def async_run(
             )
             path_payments = [p for payments in path_payments_per_account for p in payments]
             save_path_payments(path_payments)
+            save_alerts(
+                path_payment_sandwiches_to_alerts(
+                    detect_path_payment_sandwiches(path_payments)
+                )
+            )
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
             path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
