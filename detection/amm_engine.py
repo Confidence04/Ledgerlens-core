@@ -34,6 +34,10 @@ def _pair_key(row: pd.Series) -> tuple:
     return (base.get("code"), base.get("issuer"), counter.get("code"), counter.get("issuer"))
 
 
+def _is_pool_trade(value: object) -> bool:
+    return value == TradeType.LIQUIDITY_POOL or value == TradeType.LIQUIDITY_POOL.value
+
+
 def pool_round_trip_ratio(
     trades: pd.DataFrame,
     account: str,
@@ -48,7 +52,7 @@ def pool_round_trip_ratio(
         return 0.0
 
     mask = (
-        (trades["trade_type"] == TradeType.LIQUIDITY_POOL)
+        trades["trade_type"].map(_is_pool_trade)
         & (trades["liquidity_pool_id"] == pool_id)
         & (trades["base_account"] == account)
     )
@@ -112,7 +116,7 @@ def detect_profitable_pool_round_trips(
     if trades.empty or not required.issubset(trades.columns):
         return []
 
-    pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+    pool_trades = trades.loc[trades["trade_type"].map(_is_pool_trade)]
     anomalies: list[AMMRoundTripAnomaly] = []
     for (pool_id, wallet), wallet_trades in pool_trades.groupby(
         ["liquidity_pool_id", "base_account"], dropna=True
