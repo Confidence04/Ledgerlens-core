@@ -20,6 +20,7 @@ import pandas as pd
 from config.settings import get_runtime_risk_score_threshold, settings
 from config.correlation import set_correlation_id
 from config.telemetry import get_tracer
+from detection.amm_engine import amm_round_trips_to_alerts, detect_profitable_pool_round_trips
 from detection.cross_pair_engine import (
     build_volume_time_series,
     find_correlated_pairs,
@@ -337,6 +338,9 @@ def run(
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
                 save_liquidity_pool_trades(pool_trades)
+                save_alerts(
+                    amm_round_trips_to_alerts(detect_profitable_pool_round_trips(pool_trades))
+                )
 
             path_payments = load_path_payments_for_accounts(list(accounts), since)
             save_path_payments(path_payments)
@@ -562,6 +566,9 @@ async def async_run(
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
                 save_liquidity_pool_trades(pool_trades)
+                save_alerts(
+                    amm_round_trips_to_alerts(detect_profitable_pool_round_trips(pool_trades))
+                )
 
             path_payments_per_account = await asyncio.gather(
                 *(async_load_path_payments(account, since, client) for account in accounts)
