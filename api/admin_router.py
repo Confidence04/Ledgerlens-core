@@ -12,7 +12,12 @@ from pydantic import BaseModel
 
 from api.auth import require_admin_key
 from config.settings import settings, bump_config_version, invalidate_runtime_config_cache
-from detection.model_registry import get_current_version, list_model_versions
+from detection.model_registry import (
+    ModelPromotionError,
+    get_current_version,
+    list_model_versions,
+    promote_model_version,
+)
 
 logger = logging.getLogger("ledgerlens.admin")
 
@@ -68,12 +73,15 @@ def promote_model(version: str) -> dict:
             detail=f"Model files not found for version {version!r}: {missing}",
         )
 
-    for name in _MODEL_NAMES:
-        latest_path = os.path.join(model_dir, f"{name}_latest.txt")
-        with open(latest_path, "w") as f:
-            f.write(version)
+    try:
+        robustness_report = promote_model_version(version, _MODEL_NAMES, model_dir)
+    except ModelPromotionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Adversarial robustness gate rejected model promotion", "report": exc.report},
+        ) from exc
 
-    return {"promoted": version, "models": _MODEL_NAMES}
+    return {"promoted": version, "models": _MODEL_NAMES, "robustness": robustness_report}
 
 
 # ---------------------------------------------------------------------------
