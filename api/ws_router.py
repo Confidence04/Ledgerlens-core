@@ -2,20 +2,20 @@
 
 Endpoint: GET /ws/alerts?api_key=<key>[&wallet_filter=G...]
 
-Authentication: api_key query param compared against settings.admin_api_key.
+Authentication: api_key query param, enforced via api.policy (admin scope).
 Heartbeat: ping every 30s; connection dropped if no pong within 60s.
 Max connections: settings.ws_max_connections (env var LEDGERLENS_WS_MAX_CONNECTIONS, default 100).
 """
 
 import asyncio
 import logging
-import secrets
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
+from api import policy
 from config.settings import settings
 from detection.risk_score import RiskScore
 
@@ -23,6 +23,7 @@ logger = logging.getLogger("ledgerlens.ws")
 
 _HEARTBEAT_INTERVAL = 30  # seconds
 _PONG_TIMEOUT = 60         # seconds without pong → drop
+_WS_REQUIRED_SCOPE = "admin"
 
 
 @dataclass
@@ -146,8 +147,9 @@ async def ws_alerts(
     api_key: str = "",
     wallet_filter: str | None = None,
 ) -> None:
-    # --- Authentication ---
-    if not settings.admin_api_key or not secrets.compare_digest(api_key, settings.admin_api_key):
+    # --- Authentication (shared policy layer, #969) ---
+    decision = policy.enforce(_WS_REQUIRED_SCOPE, admin_key=api_key, api_key=api_key)
+    if not decision.allowed:
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

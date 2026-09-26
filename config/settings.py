@@ -220,6 +220,13 @@ class Settings(BaseSettings):
     ledgerlens_admin_api_key: str = ""
     ledgerlens_compliance_api_key: str = ""
     ledgerlens_model_signing_key: str = ""
+    # ── JWT access / refresh tokens (api/auth.py, #967) ─────────────────────
+    # HS256 signing key; falls back to ledgerlens_service_secret_key when empty.
+    jwt_signing_key: str = ""
+    jwt_issuer: str = "ledgerlens"
+    # Access tokens are short-lived and audience-scoped (rest|graphql|grpc|ws).
+    jwt_access_ttl_seconds: int = 300
+    jwt_refresh_ttl_seconds: int = 86400
     ledgerlens_webhook_encryption_key: str = ""
     ledgerlens_webhook_encryption_key_previous: str = ""
     api_key_rotation_grace_seconds: int = 604800
@@ -370,6 +377,11 @@ class Settings(BaseSettings):
     waf_max_body_bytes: int = 1_048_576
     # Timeout in seconds for slow request mitigation
     waf_slow_request_timeout_seconds: float = 10.0
+    # Per-minute rate limit keyed by API-key tier (IP fallback when anonymous).
+    # Per-tier limits are tuned at runtime via LEDGERLENS_TIER_LIMITS_FILE (api/policy.py).
+    waf_tier_rate_limit_enabled: bool = True
+    # Distinct API keys from one /24 (or /48) within a minute that trigger a key-cycling alert
+    waf_key_cycling_threshold: int = 10
 
     # ── Trace Sampling ──────────────────────────────────────────────────────────
     # Sampling strategy: "static" (head-based) or "tail" (tail-based)

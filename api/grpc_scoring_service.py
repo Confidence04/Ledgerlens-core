@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import secrets
 from collections.abc import Iterator
 
 import grpc
 
+from api import policy
 from config.settings import settings
 from detection import storage
-from detection.api_key_store import check_rate_limit, lookup_key
 from generated import scoring_pb2, scoring_pb2_grpc
 
 logger = logging.getLogger("ledgerlens.grpc_scoring_service")
@@ -26,34 +25,25 @@ def mask_wallet(wallet: str) -> str:
     return f"{wallet[:8]}...{wallet[-4:]}"
 
 
+_GRPC_STATUS = {
+    policy.UNAUTHENTICATED: grpc.StatusCode.UNAUTHENTICATED,
+    policy.FORBIDDEN: grpc.StatusCode.PERMISSION_DENIED,
+    policy.RATE_LIMITED: grpc.StatusCode.RESOURCE_EXHAUSTED,
+}
+
+
 def _authenticate(context: grpc.ServicerContext, required_scope: str = "read:scores") -> dict:
-    # Check for cached auth state in invocation metadata
+    """Enforce auth / scope / rate limit via the shared policy layer (#969)."""
     metadata = dict(context.invocation_metadata())
-    api_key = metadata.get("x-ledgerlens-api-key", "") or metadata.get("x-ledgerlens-admin-key", "")
-    if not api_key:
+    api_key = metadata.get("x-ledgerlens-api-key", "")
+    admin_key = metadata.get("x-ledgerlens-admin-key", "") or api_key
+    if not api_key and not admin_key:
         context.abort(grpc.StatusCode.UNAUTHENTICATED, "Missing x-ledgerlens-api-key metadata")
 
-    # First check if it's the configured admin key (admin keys satisfy any scope)
-    if settings.admin_api_key and secrets.compare_digest(api_key, settings.admin_api_key):
-        return {"key_id": "admin", "scopes": "admin", "rate_limit_per_minute": 999999}
-
-    # Fall back to stored API key lookup
-    key_meta = lookup_key(api_key)
-    if key_meta is None:
-        context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid or revoked API key")
-
-    scopes = set(key_meta["scopes"].split(",")) if key_meta.get("scopes") else set()
-    if required_scope not in scopes and "admin" not in scopes:
-        context.abort(
-            grpc.StatusCode.PERMISSION_DENIED,
-            f"This endpoint requires the '{required_scope}' scope",
-        )
-
-    allowed, retry_after = check_rate_limit(key_meta["key_id"], key_meta["rate_limit_per_minute"])
-    if not allowed:
-        context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "Rate limit exceeded")
-
-    return key_meta
+    decision = policy.enforce(required_scope, admin_key=admin_key, api_key=api_key)
+    if not decision.allowed:
+        context.abort(_GRPC_STATUS[decision.status], decision.detail)
+    return decision.key_meta
 
 
 def _to_proto(score_obj) -> scoring_pb2.RiskScoreProto:

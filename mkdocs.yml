@@ -114,6 +114,7 @@ nav:
       - Streaming Scorer: streaming_scorer.md
       - gRPC Scoring: grpc_scoring.md
       - API Gateway: api_gateway.md
+      - API Policy Model: api_policy.md
       - API Versioning: api_versioning.md
       - Vector Similarity Search: vector_similarity_search.md
       - WAF and Rate Limiting: waf_and_rate_limiting.md
