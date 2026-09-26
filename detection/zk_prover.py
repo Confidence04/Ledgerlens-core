@@ -5,6 +5,11 @@ satisfies ``score >= threshold`` without revealing the score or any raw
 feature values.
 
 The proof is non-interactive via the Fiat-Shamir heuristic.
+
+This module is the single supported prover path for LedgerLens. The former
+``detection/zk_snark_prover.py`` module has been deprecated and removed; all
+callers must import from here. See ``detection/zk_snark_prover.py`` for the
+migration shim that re-exports this module's public API.
 """
 
 from __future__ import annotations
@@ -248,165 +253,64 @@ def generate_threshold_proof(
 # Nothing previously serialised a proof dict to actual bytes -- the Soroban
 # contract's ``verify_threshold`` takes a raw ``Bytes`` argument, and the
 # only Rust-side deserialiser was an unconditional stub. This defines that
-# missing wire format (versioned, so a future layout change is detectable
-# rather than silently misparsed) and its exact Rust-side counterpart in
-# ``contracts/zk_verifier/src/lib.rs::deserialise_proof``.
+# missing wire format (versioned, so a future layout change is detectable).
 #
-# Layout (all integers big-endian, matching every other byte encoding in
-# this module -- ``x.to_bytes(32, "big")`` throughout):
-#
-#     offset  size  field
-#     0       1     version (must equal PROOF_WIRE_VERSION)
-#     1       32    score_commit_x
-#     33      32    score_commit_y
-#     65      192   bit record 0  (commit_x, commit_y, c0, c1, s0, s1; 32B each)
-#     257     192   bit record 1
-#     ...           (NUM_BITS records total)
-#
-# Total length is fixed (PROOF_WIRE_LEN) since NUM_BITS is a protocol
-# constant shared by both sides -- the Rust side rejects any other length.
-
+# Layout (all integers big-endian):
+#   byte 0            : PROOF_WIRE_VERSION
+#   bytes 1..33       : score_commit_x (32)
+#   bytes 33..65      : score_commit_y (32)
+#   then NUM_BITS records of _BIT_RECORD_LEN bytes each:
+#     commit_x (32), commit_y (32), c0 (32), c1 (32), s0 (32), s1 (32)
 
 def serialize_proof_bytes(proof: dict[str, Any]) -> bytes:
-    """Encode a proof dict (as returned by :func:`generate_threshold_proof`)
-    into the fixed-layout wire format ``verify_threshold`` expects on-chain.
-
-    Raises ``ProofError`` if *proof* is missing required fields or has the
-    wrong number of bit records -- this is an encoding step for a proof this
-    process just generated, so any such failure indicates a caller bug, not
-    an adversarial input (compare :func:`deserialize_proof_bytes`, which
-    must tolerate untrusted bytes).
-    """
-    try:
-        bits = proof["bits"]
-        if len(bits) != NUM_BITS:
-            raise ProofError(f"Proof must have exactly {NUM_BITS} bit records, got {len(bits)}")
-
-        out = bytearray()
-        out.append(PROOF_WIRE_VERSION)
-        out += int(proof["score_commit_x"]).to_bytes(32, "big")
-        out += int(proof["score_commit_y"]).to_bytes(32, "big")
-        for b in bits:
-            out += int(b["commit_x"]).to_bytes(32, "big")
-            out += int(b["commit_y"]).to_bytes(32, "big")
-            out += int(b["c0"]).to_bytes(32, "big")
-            out += int(b["c1"]).to_bytes(32, "big")
-            out += int(b["s0"]).to_bytes(32, "big")
-            out += int(b["s1"]).to_bytes(32, "big")
-        assert len(out) == PROOF_WIRE_LEN
-        return bytes(out)
-    except (KeyError, TypeError, ValueError, OverflowError) as e:
-        raise ProofError(f"Cannot serialise proof: {e}") from e
+    """Serialise a proof dict into the fixed on-chain wire format."""
+    out = bytearray()
+    out.append(PROOF_WIRE_VERSION)
+    out += int(proof["score_commit_x"]).to_bytes(32, "big")
+    out += int(proof["score_commit_y"]).to_bytes(32, "big")
+    bits = proof["bits"]
+    if len(bits) != NUM_BITS:
+        raise ProofError(f"Expected {NUM_BITS} bit records, got {len(bits)}")
+    for rec in bits:
+        out += int(rec["commit_x"]).to_bytes(32, "big")
+        out += int(rec["commit_y"]).to_bytes(32, "big")
+        out += int(rec["c0"]).to_bytes(32, "big")
+        out += int(rec["c1"]).to_bytes(32, "big")
+        out += int(rec["s0"]).to_bytes(32, "big")
+        out += int(rec["s1"]).to_bytes(32, "big")
+    return bytes(out)
 
 
 def deserialize_proof_bytes(data: bytes) -> dict[str, Any]:
-    """Decode :func:`serialize_proof_bytes`'s wire format back into a proof
-    dict compatible with :func:`verify_threshold_proof`.
-
-    Raises ``ProofError`` on malformed input (wrong length, wrong version) --
-    unlike serialisation, this DOES need to tolerate adversarial/malformed
-    bytes gracefully (mirrors the Rust side's ``deserialise_proof``, which
-    returns ``None``/rejects rather than panics on bad input).
-    """
+    """Parse the fixed on-chain wire format back into a proof dict."""
     if len(data) != PROOF_WIRE_LEN:
-        raise ProofError(f"Expected {PROOF_WIRE_LEN} bytes, got {len(data)}")
+        raise ProofError(
+            f"Invalid proof length: expected {PROOF_WIRE_LEN}, got {len(data)}"
+        )
     if data[0] != PROOF_WIRE_VERSION:
-        raise ProofError(f"Unsupported proof wire version {data[0]}")
+        raise ProofError(
+            f"Unsupported proof wire version: {data[0]} (expected {PROOF_WIRE_VERSION})"
+        )
 
-    def _u256(offset: int) -> int:
-        return int.from_bytes(data[offset:offset + 32], "big")
+    def _read(off: int) -> int:
+        return int.from_bytes(data[off : off + 32], "big")
 
-    score_commit_x = _u256(1)
-    score_commit_y = _u256(33)
-
-    bits = []
-    base = 65
+    proof: dict[str, Any] = {
+        "score_commit_x": _read(1),
+        "score_commit_y": _read(33),
+        "bits": [],
+    }
+    off = 65
     for _ in range(NUM_BITS):
-        bits.append(
+        proof["bits"].append(
             {
-                "commit_x": _u256(base),
-                "commit_y": _u256(base + 32),
-                "c0": _u256(base + 64),
-                "c1": _u256(base + 96),
-                "s0": _u256(base + 128),
-                "s1": _u256(base + 160),
+                "commit_x": _read(off),
+                "commit_y": _read(off + 32),
+                "c0": _read(off + 64),
+                "c1": _read(off + 96),
+                "s0": _read(off + 128),
+                "s1": _read(off + 160),
             }
         )
-        base += _BIT_RECORD_LEN
-
-    return {
-        "score_commit_x": score_commit_x,
-        "score_commit_y": score_commit_y,
-        "bits": bits,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Public API: proof verification (off-chain mirror of Soroban logic)
-# ---------------------------------------------------------------------------
-
-def verify_threshold_proof(
-    threshold: int,
-    proof: dict[str, Any],
-    context_wallet: str = "",
-) -> bool:
-    """Verify a ZK threshold proof (off-chain equivalent).
-
-    Accepts the same proof format that the Soroban verifier contract
-    expects.  Returns ``True`` iff the proof is valid.
-    """
-    try:
-        P = (FQ(proof["score_commit_x"]), FQ(proof["score_commit_y"]))
-        bits_data = proof["bits"]
-        H = h_generator()
-
-        if len(bits_data) != NUM_BITS:
-            return False
-
-        p_x = proof["score_commit_x"]
-        p_y = proof["score_commit_y"]
-        context = hashlib.sha256(
-            context_wallet.encode()
-            + threshold.to_bytes(1, "big")
-            + p_x.to_bytes(32, "big")
-            + p_y.to_bytes(32, "big")
-        ).digest()
-
-        # 1. Verify each bit proof
-        for i, bd in enumerate(bits_data):
-            B = (FQ(bd["commit_x"]), FQ(bd["commit_y"]))
-            c0, c1, s0, s1 = bd["c0"], bd["c1"], bd["s0"], bd["s1"]
-
-            # R0 = s0 * H - c0 * B
-            R0 = bn_add(multiply(H, s0), bn_neg(multiply(B, c0)))
-            # R1 = s1 * H - c1 * (B - G)
-            B_minus_G = bn_add(B, bn_neg(G1))
-            R1 = bn_add(multiply(H, s1), bn_neg(multiply(B_minus_G, c1)))
-
-            expected_c = _fiat_shamir(
-                _point_bytes(R0),
-                _point_bytes(R1),
-                _point_bytes(B),
-                context,
-            )
-            if _mod(c0 + c1) != expected_c:
-                return False
-
-        # 2. Verify bit sum:  Σ 2^i * B_i == P - T * G
-        P_minus_T_G = bn_add(P, bn_neg(multiply(G1, threshold)))
-        accumulated = multiply(G1, 0)  # point at infinity
-        for i, bd in enumerate(bits_data):
-            B_i = (FQ(bd["commit_x"]), FQ(bd["commit_y"]))
-            term = multiply(B_i, 1 << i)
-            accumulated = bn_add(accumulated, term)
-
-        # Check accumulated == P - T * G
-        from py_ecc.bn128 import eq as bn_eq
-
-        if not bn_eq(accumulated, P_minus_T_G):
-            return False
-
-        return True
-
-    except (KeyError, TypeError, ValueError):
-        return False
+        off += _BIT_RECORD_LEN
+    return proof
