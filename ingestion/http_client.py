@@ -9,9 +9,13 @@ This module provides two client implementations:
 
 Rate limiting
 -------------
-``TokenBucketRateLimiter`` enforces a proactive per-client request budget so the
-pipeline stays below Horizon's per-IP rate limit before 429s occur.  When tokens
-are exhausted the acquirer yields the event loop rather than blocking a thread.
+The default limiter is ``ingestion.rate_limiter.HorizonAdaptiveRateLimiter``:
+a token bucket whose rate is re-derived from Horizon's ``X-Ratelimit-*``
+headers on every response, so the pipeline spends available quota without
+exceeding it.  A 429 pauses all callers (``Retry-After`` or exponential
+backoff) before header-driven tuning resumes.  ``TokenBucketRateLimiter`` is
+kept as a fixed-rate alternative.  When tokens are exhausted the acquirer
+yields the event loop rather than blocking a thread.
 
 Retry logic
 -----------
@@ -59,6 +63,7 @@ except ImportError:  # pragma: no cover - depends on installed extras
     _HTTP2_AVAILABLE = False
 
 from ingestion.metrics import _normalise_endpoint, get_metrics
+from ingestion.rate_limiter import HorizonAdaptiveRateLimiter
 
 _metrics = get_metrics()
 logger = logging.getLogger(__name__)
@@ -518,7 +523,7 @@ class AsyncHorizonClient:
         max_retry_delay: float | None = None,
         version_guard: "VersionGuard | None | object" = _UNSET,
         probe_timeout: float = 5.0,
-        rate_limiter: "TokenBucketRateLimiter | None" = None,
+        rate_limiter: "HorizonAdaptiveRateLimiter | TokenBucketRateLimiter | None" = None,
         rate_limit_rps: float | None = None,
         rate_burst: float | None = None,
         max_keepalive_connections: int | None = None,
@@ -561,7 +566,7 @@ class AsyncHorizonClient:
             settings.horizon_max_retry_delay if settings is not None else 60.0
         )
         self._probe_timeout = probe_timeout
-        self._rate_limiter = rate_limiter or TokenBucketRateLimiter(
+        self._rate_limiter = rate_limiter or HorizonAdaptiveRateLimiter(
             rate=rate_limit_rps if rate_limit_rps is not None else (
                 settings.horizon_rate_limit_rps if settings is not None else 5.0
             ),
@@ -630,18 +635,10 @@ class AsyncHorizonClient:
 
         extensions = {**kwargs.pop("extensions", {}), "trace": _trace}
         async with self._semaphore:
-            try:
-                response = await getattr(self._client, method.lower())(
-                    url, extensions=extensions, **kwargs
-                )
-            except httpx.PoolTimeout:
-                _metrics.http_pool_exhaustion_total.inc()
-                logger.warning("Horizon connection pool exhausted for %s", url)
-                raise
-        if opened:
-            _metrics.http_connections_opened_total.inc()
-        else:
-            _metrics.http_connections_reused_total.inc()
+            response = await getattr(self._client, method.lower())(url, **kwargs)
+        observe = getattr(self._rate_limiter, "observe_response", None)
+        if observe is not None:
+            observe(response.status_code, response.headers)
         response.raise_for_status()
         if self._version_guard is not None:
             self._version_guard.check(response.headers, url)

@@ -141,12 +141,15 @@ class _NoOpCollector:
     http_request_duration_seconds = _NoOpMetric()
     http_rate_limit_hits_total = _NoOpMetric()
     http_retries_total = _NoOpMetric()
-    http_connections_opened_total = _NoOpMetric()
-    http_connections_reused_total = _NoOpMetric()
-    http_pool_exhaustion_total = _NoOpMetric()
+    http_rate_limit_allowed_rps = _NoOpMetric()
+    http_effective_throughput_rps = _NoOpMetric()
+    http_quota_utilization_ratio = _NoOpMetric()
+    http_rate_limit_backoffs_total = _NoOpMetric()
     ledger_close_to_score_seconds = _NoOpMetric()
     dlq_entries_total = _NoOpMetric()
     dlq_depth = _NoOpMetric()
+    dlq_oldest_entry_age_seconds = _NoOpMetric()
+    dlq_quarantined_total = _NoOpMetric()
     checkpoint_desync_detected_total = _NoOpMetric()
 
 
@@ -185,12 +188,10 @@ class IngestionMetricsCollector:
       - ``ledgerlens_http_rate_limit_hits_total`` — HTTP 429 responses.
       - ``ledgerlens_http_retries_total`` — retry attempts labelled by
         ``reason`` (``"5xx"``, ``"429"``, ``"timeout"``).
-      - ``ledgerlens_http_connections_opened_total`` /
-        ``ledgerlens_http_connections_reused_total`` — requests served on a
-        new vs. pooled connection.  Reuse rate is
-        ``reused / (reused + opened)``; target is >= 0.95 under sustained polling.
-      - ``ledgerlens_http_pool_exhaustion_total`` — requests that timed out
-        waiting for a free pooled connection (alert on any sustained rate).
+      - ``ledgerlens_http_rate_limit_allowed_rps`` — header-derived limiter rate.
+      - ``ledgerlens_http_effective_throughput_rps`` — requests actually sent/s.
+      - ``ledgerlens_http_quota_utilization_ratio`` — Horizon quota consumed.
+      - ``ledgerlens_http_rate_limit_backoffs_total`` — 429-driven pauses.
 
     **Pipeline latency**
       - ``ledgerlens_ledger_close_to_score_seconds`` — end-to-end latency from
@@ -199,6 +200,8 @@ class IngestionMetricsCollector:
     **Dead-letter queue**
       - ``ledgerlens_dlq_entries_total`` — records sent to the DLQ.
       - ``ledgerlens_dlq_depth`` — current DLQ depth gauge.
+      - ``ledgerlens_dlq_oldest_entry_age_seconds`` — age of oldest pending entry.
+      - ``ledgerlens_dlq_quarantined_total`` — entries quarantined as poison messages.
 
     **Stream checkpoint coordination** (``ingestion/stream_checkpoint.py``)
       - ``ledgerlens_checkpoint_desync_detected_total`` — incremented when
@@ -273,17 +276,21 @@ class IngestionMetricsCollector:
             "Total retry attempts for failed HTTP requests",
             ["reason"],
         )
-        self.http_connections_opened_total = Counter(
-            "ledgerlens_http_connections_opened_total",
-            "Horizon requests that required opening a new TCP connection",
+        self.http_rate_limit_allowed_rps = Gauge(
+            "ledgerlens_http_rate_limit_allowed_rps",
+            "Current adaptive limiter rate derived from Horizon rate-limit headers",
         )
-        self.http_connections_reused_total = Counter(
-            "ledgerlens_http_connections_reused_total",
-            "Horizon requests served on an existing pooled connection",
+        self.http_effective_throughput_rps = Gauge(
+            "ledgerlens_http_effective_throughput_rps",
+            "Requests actually dispatched to Horizon per second (60s window)",
         )
-        self.http_pool_exhaustion_total = Counter(
-            "ledgerlens_http_pool_exhaustion_total",
-            "Horizon requests that timed out waiting for a pooled connection",
+        self.http_quota_utilization_ratio = Gauge(
+            "ledgerlens_http_quota_utilization_ratio",
+            "Fraction of the Horizon rate-limit window quota consumed",
+        )
+        self.http_rate_limit_backoffs_total = Counter(
+            "ledgerlens_http_rate_limit_backoffs_total",
+            "Total 429-driven backoff pauses applied by the adaptive limiter",
         )
 
         # ── Pipeline latency ──────────────────────────────────────────────
@@ -302,6 +309,15 @@ class IngestionMetricsCollector:
         self.dlq_depth = Gauge(
             "ledgerlens_dlq_depth",
             "Current number of pending DLQ entries",
+        )
+        self.dlq_oldest_entry_age_seconds = Gauge(
+            "ledgerlens_dlq_oldest_entry_age_seconds",
+            "Age in seconds of the oldest pending DLQ entry (0 when empty)",
+        )
+        self.dlq_quarantined_total = Counter(
+            "ledgerlens_dlq_quarantined_total",
+            "Total DLQ entries quarantined after repeated replay failures",
+            ["error_class"],
         )
 
         # ── Stream checkpoint coordination ────────────────────────────────
