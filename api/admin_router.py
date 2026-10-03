@@ -148,10 +148,13 @@ def promote_model(version: str) -> dict:
             detail=f"Model files not found for version {version!r}: {missing}",
         )
 
-    for name in _MODEL_NAMES:
-        latest_path = os.path.join(model_dir, f"{name}_latest.txt")
-        with open(latest_path, "w") as f:
-            f.write(version)
+    try:
+        robustness_report = promote_model_version(version, _MODEL_NAMES, model_dir)
+    except ModelPromotionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Adversarial robustness gate rejected model promotion", "report": exc.report},
+        ) from exc
 
     from api.metrics import model_lifecycle_events_total
 

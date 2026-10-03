@@ -154,6 +154,12 @@ def save_versioned_model(
     """
     Path(model_dir).mkdir(parents=True, exist_ok=True)
 
+    reference_models = {}
+    active_version = get_current_version(name, model_dir)
+    if active_version is not None:
+        reference_models[name] = load_versioned_model(name, active_version, model_dir)
+    validate_model_promotion_robustness({name: model}, reference_models)
+
     model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
     import joblib
     joblib.dump(model, model_path)
@@ -192,6 +198,11 @@ def load_latest_model(
     with open(latest_path, "r") as f:
         version = f.read().strip()
 
+    return load_versioned_model(name, version, model_dir)
+
+
+def load_versioned_model(name: str, version: str, model_dir: str):
+    """Load and verify a specific versioned model without changing its pointer."""
     model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Versioned model not found: {model_path}")
@@ -200,6 +211,47 @@ def load_latest_model(
     model = safe_joblib_load(model_path, settings.model_signing_key.encode())
     logger.info("Loaded %s version %s from %s", name, version, model_path)
     return model
+
+
+class ModelPromotionError(RuntimeError):
+    """Raised when an adversarial robustness gate rejects model promotion."""
+
+    def __init__(self, report: dict) -> None:
+        self.report = report
+        super().__init__(f"Adversarial robustness gate failed: {report}")
+
+
+def validate_model_promotion_robustness(
+    candidate_models: dict,
+    reference_models: dict | None = None,
+) -> dict:
+    """Run the mandatory adversarial robustness gate for candidate models."""
+    from detection.robustness_eval import evaluate_promotion_robustness
+
+    report = evaluate_promotion_robustness(candidate_models, reference_models)
+    if not report["passed"]:
+        raise ModelPromotionError(report)
+    return report
+
+
+def promote_model_version(version: str, model_names: list[str], model_dir: str) -> dict:
+    """Validate a complete model version before moving active pointers."""
+    candidate_models = {
+        name: load_versioned_model(name, version, model_dir) for name in model_names
+    }
+    reference_models = {}
+    for name in model_names:
+        active_version = get_current_version(name, model_dir)
+        if active_version is not None:
+            reference_models[name] = load_versioned_model(name, active_version, model_dir)
+
+    report = validate_model_promotion_robustness(candidate_models, reference_models)
+    for name in model_names:
+        latest_path = os.path.join(model_dir, f"{name}_latest.txt")
+        with open(latest_path, "w") as f:
+            f.write(version)
+    logger.info("Promoted model version %s after adversarial validation", version)
+    return report
 
 
 def rollback_model(

@@ -778,6 +778,28 @@ def save_models(
 
     version = _compute_version_hash(training_row_count, column_hash)
 
+    candidate_models = {
+        name: result["model"]
+        for name, result in results.items()
+        if not name.startswith("_") and isinstance(result, dict) and "model" in result
+    }
+    reference_models = {}
+    robustness_report = None
+    if candidate_models:
+        from detection.model_registry import (
+            get_current_version,
+            load_versioned_model,
+            validate_model_promotion_robustness,
+        )
+
+        for name in candidate_models:
+            active_version = get_current_version(name, model_dir)
+            if active_version is not None:
+                reference_models[name] = load_versioned_model(name, active_version, model_dir)
+        robustness_report = validate_model_promotion_robustness(
+            candidate_models, reference_models
+        )
+
     from detection.lineage import lineage, Dataset
 
     reproducibility = results.get("_reproducibility", {})
@@ -878,6 +900,11 @@ def save_models(
                 )
             )
 
+    for name in candidate_models:
+        latest_path = os.path.join(model_dir, f"{name}_latest.txt")
+        with open(latest_path, "w") as f:
+            f.write(version)
+
     _causal_selected = results.get("_causal_selected_features")
     metadata = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -885,6 +912,7 @@ def save_models(
         "training_dataset_path": training_dataset_path or "",
         "training_row_count": training_row_count,
         "column_hash": column_hash,
+        "adversarial_robustness": robustness_report,
         "imbalance_strategy": results.get("_imbalance_strategy", "smote"),
         "causal_feature_selection": _causal_selected is not None,
         "causal_selected_features": _causal_selected or [],

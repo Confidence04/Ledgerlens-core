@@ -20,6 +20,7 @@ import pandas as pd
 from config.settings import get_runtime_risk_score_threshold, settings
 from config.correlation import set_correlation_id
 from config.telemetry import get_tracer
+from detection.amm_engine import amm_round_trips_to_alerts, detect_profitable_pool_round_trips
 from detection.cross_pair_engine import (
     build_volume_time_series,
     find_correlated_pairs,
@@ -31,7 +32,11 @@ from detection.feature_store import FeatureStore
 from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
 from detection.path_cycle_detector import detect_cycles_from_payments, path_payment_cycles_to_alerts
-from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.path_payment_engine import (
+    detect_atomic_circular_routes,
+    detect_path_payment_sandwiches,
+    path_payment_sandwiches_to_alerts,
+)
 from detection.event_bus import get_event_bus
 from detection.risk_score import RiskScore
 from detection.storage import (
@@ -337,9 +342,17 @@ def run(
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
                 save_liquidity_pool_trades(pool_trades)
+                save_alerts(
+                    amm_round_trips_to_alerts(detect_profitable_pool_round_trips(pool_trades))
+                )
 
             path_payments = load_path_payments_for_accounts(list(accounts), since)
             save_path_payments(path_payments)
+            save_alerts(
+                path_payment_sandwiches_to_alerts(
+                    detect_path_payment_sandwiches(path_payments)
+                )
+            )
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
             path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
@@ -568,12 +581,20 @@ async def async_run(
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
                 save_liquidity_pool_trades(pool_trades)
+                save_alerts(
+                    amm_round_trips_to_alerts(detect_profitable_pool_round_trips(pool_trades))
+                )
 
             path_payments_per_account = await asyncio.gather(
                 *(async_load_path_payments(account, since, client) for account in accounts)
             )
             path_payments = [p for payments in path_payments_per_account for p in payments]
             save_path_payments(path_payments)
+            save_alerts(
+                path_payment_sandwiches_to_alerts(
+                    detect_path_payment_sandwiches(path_payments)
+                )
+            )
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
             path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))

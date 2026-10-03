@@ -61,6 +61,29 @@ def test_promote_model_rejects_unknown_version(client):
     assert "9.9.9" in resp.json()["detail"]
 
 
+def test_promote_model_returns_409_when_robustness_gate_rejects(client, monkeypatch):
+    from pathlib import Path
+
+    from api import admin_router
+    from detection.model_registry import ModelPromotionError
+
+    model_dir = Path(admin_router.settings.model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("random_forest", "xgboost", "lightgbm"):
+        (model_dir / f"{name}_vcandidate.joblib").write_text("")
+
+    report = {"passed": False, "models": {"random_forest": {"evasion_rate": 0.6}}}
+
+    def reject_promotion(version, model_names, model_dir):
+        raise ModelPromotionError(report)
+
+    monkeypatch.setattr(admin_router, "promote_model_version", reject_promotion)
+    response = client.post("/admin/models/candidate/promote")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["report"] == report
+
+
 def test_module_has_no_dead_rate_limiter():
     """The unused slowapi limiter and stray logger alias were removed."""
     import api.admin_router as admin_router

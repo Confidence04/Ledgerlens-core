@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -85,6 +86,136 @@ class PathPaymentCycle:
     def crosses_bridge(self) -> bool:
         """True when the cycle leaves Stellar through a bridge and comes back."""
         return any(h.operation_id.startswith(BRIDGE_HOP_PREFIX) for h in self.hops)
+
+
+@dataclass
+class PathPaymentSandwichCandidate:
+    attacker: str
+    victim: str
+    asset_pair: str
+    front_run_id: str
+    victim_payment_id: str
+    back_run_id: str
+    recovery_ratio: float
+    path_hops: int
+    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+def detect_path_payment_sandwiches(
+    payments: list[PathPayment],
+    max_window: pd.Timedelta = pd.Timedelta(minutes=5),
+    min_return_ratio: float = 1.0,
+) -> list[PathPaymentSandwichCandidate]:
+    """Detect profitable attacker/victim/attacker sequences over routed payments.
+
+    The attacker's opening and closing payments must exchange the same asset
+    pair in opposite directions. A victim payment between them must share an
+    intermediate route asset, and the attacker must recover more of its
+    starting asset than it spent after the complete round trip.
+    """
+    if max_window < pd.Timedelta(0):
+        raise ValueError("max_window must be non-negative")
+    if min_return_ratio < 0:
+        raise ValueError("min_return_ratio must be non-negative")
+    if not payments:
+        return []
+
+    ordered = sorted(payments, key=lambda p: (p.timestamp, p.id))
+    timestamps = [p.timestamp for p in ordered]
+    closings: dict[tuple[str, str, str], list[PathPayment]] = defaultdict(list)
+    for payment in ordered:
+        closings[
+            (
+                payment.source_account,
+                payment.source_asset.pair_symbol,
+                payment.destination_asset.pair_symbol,
+            )
+        ].append(payment)
+
+    candidates: list[PathPaymentSandwichCandidate] = []
+    seen: set[tuple[str, str, str]] = set()
+    for opening_idx, opening in enumerate(ordered):
+        opening_assets = {asset.pair_symbol for asset in opening.path}
+        opening_assets.add(opening.destination_asset.pair_symbol)
+        reverse_key = (
+            opening.source_account,
+            opening.destination_asset.pair_symbol,
+            opening.source_asset.pair_symbol,
+        )
+        first_close_idx = bisect_right(
+            timestamps, opening.timestamp, lo=opening_idx + 1
+        )
+        last_close_idx = bisect_right(
+            timestamps, opening.timestamp + max_window, lo=first_close_idx
+        )
+        for closing in closings.get(reverse_key, []):
+            if closing.timestamp <= opening.timestamp:
+                continue
+            if closing.timestamp > opening.timestamp + max_window:
+                break
+            if closing.id == opening.id:
+                continue
+            recovery_ratio = float(closing.destination_amount / opening.source_amount)
+            if recovery_ratio <= min_return_ratio:
+                continue
+
+            close_assets = {asset.pair_symbol for asset in closing.path}
+            close_assets.add(closing.source_asset.pair_symbol)
+            route_assets = opening_assets | close_assets
+            victim_start = first_close_idx
+            victim_end = min(bisect_left(timestamps, closing.timestamp, lo=victim_start), last_close_idx)
+            for victim in ordered[victim_start:victim_end]:
+                if victim.source_account == opening.source_account or not victim.path:
+                    continue
+                victim_assets = {asset.pair_symbol for asset in victim.path}
+                if not route_assets.intersection(victim_assets):
+                    continue
+
+                signature = (opening.id, victim.id, closing.id)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                candidates.append(
+                    PathPaymentSandwichCandidate(
+                        attacker=opening.source_account,
+                        victim=victim.source_account,
+                        asset_pair=(
+                            f"{opening.source_asset.pair_symbol}/"
+                            f"{opening.destination_asset.pair_symbol}"
+                        ),
+                        front_run_id=opening.id,
+                        victim_payment_id=victim.id,
+                        back_run_id=closing.id,
+                        recovery_ratio=recovery_ratio,
+                        path_hops=len(opening.path) + len(victim.path) + len(closing.path) + 3,
+                    )
+                )
+                break
+
+    return candidates
+
+
+def path_payment_sandwiches_to_alerts(
+    candidates: list[PathPaymentSandwichCandidate],
+) -> list[dict]:
+    """Convert routed-payment sandwich candidates into standard attack alerts."""
+    return [
+        {
+            "alert_type": "SANDWICH_ATTACK",
+            "wallet": candidate.attacker,
+            "asset_pair": candidate.asset_pair,
+            "detail": {
+                "attack_surface": "stellar_path_payment",
+                "victim": candidate.victim,
+                "front_run_id": candidate.front_run_id,
+                "victim_payment_id": candidate.victim_payment_id,
+                "back_run_id": candidate.back_run_id,
+                "recovery_ratio": candidate.recovery_ratio,
+                "path_hops": candidate.path_hops,
+            },
+        }
+        for candidate in candidates
+    ]
 
 
 # ── Scoring ──────────────────────────────────────────────────────────────────
