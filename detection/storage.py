@@ -5,6 +5,11 @@ integration point is wired up (see README's "Open Integration Points"),
 `run_pipeline.py` and the local API (`api/main.py`) persist and read
 `RiskScore` records here.
 
+This module is the single persistence abstraction for detection data. A
+parallel SQLAlchemy Core store (`detection/storage_orm.py`) previously
+duplicated `RiskScoreStore.upsert_trades` but had no callers; it was removed
+in #978 to avoid divergent query and transaction semantics.
+
 ## How to add a new migration
 1. Append a tuple to `_MIGRATIONS`:
        (version, "short description", "ALTER TABLE ... or CREATE TABLE ...")
@@ -569,12 +574,59 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         """,
     ),
+    (
+        20,
+        "durable pending_chain_submissions queue",
+        """
+        -- Durable replacement for the fire-and-forget daemon thread that used
+        -- to publish dispute overrides on-chain (detection/dispute_store.py).
+        -- A row here is a standing obligation to write something to the chain;
+        -- it outlives the process that created it and is worked off by
+        -- detection/chain_submission_queue.py.
+        --
+        -- idempotency_key carries a UNIQUE constraint: it is what makes "one
+        -- dispute resolution produces at most one successful on-chain
+        -- submission" enforceable by the database rather than by convention,
+        -- including across concurrent workers and process restarts.
+        CREATE TABLE IF NOT EXISTS pending_chain_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            override_id INTEGER,
+            dispute_id TEXT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 10,
+            next_attempt_at TEXT NOT NULL,
+            -- Set when a worker claims the row; a claim older than the lease
+            -- window is reclaimable, which is how a submission survives the
+            -- worker being killed mid-flight.
+            leased_until TEXT,
+            last_error TEXT,
+            tx_hash TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_chain_submissions_due
+            ON pending_chain_submissions (status, next_attempt_at);
+        CREATE INDEX IF NOT EXISTS idx_pending_chain_submissions_override
+            ON pending_chain_submissions (override_id);
+        """,
+    ),
 ]
 
 
 @contextmanager
 def _connect(db_path: str | None = None):
-    conn = sqlite3.connect(db_path or settings.db_path)
+    # A short, explicit timeout so lock contention surfaces immediately as
+    # sqlite3.OperationalError (which api/main.py's exception handler turns
+    # into 503 + Retry-After) instead of blocking the request thread for
+    # sqlite3's default 5s busy-wait. Request-serving code should fail fast
+    # and let the client back off and retry, not silently stall.
+    conn = sqlite3.connect(db_path or settings.db_path, timeout=1.0)
     try:
         yield conn
     finally:
@@ -1790,6 +1842,27 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
             ],
         )
         conn.commit()
+
+
+def retract_bridge_transfers(
+    chain: str, tx_hashes: set[str] | list[str], db_path: str | None = None
+) -> int:
+    """Delete bridge transfers ingested from reorged (orphaned) EVM blocks.
+
+    Returns the number of rows removed.
+    """
+    hashes = list(tx_hashes)
+    if not hashes:
+        return 0
+    init_db(db_path)
+    placeholders = ",".join("?" for _ in hashes)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            f"DELETE FROM bridge_transfers WHERE chain = ? AND tx_hash_evm IN ({placeholders})",
+            (chain, *hashes),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def get_bridge_transfers(

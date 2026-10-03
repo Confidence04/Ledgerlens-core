@@ -11,6 +11,41 @@ all columns *except* ``entry_hash``.
 A ``genesis`` entry (prev_hash="genesis") is automatically inserted when the
 table is first created.
 
+Signing secret
+--------------
+The HMAC key comes from ``LEDGERLENS_AUDIT_SECRET`` and has no hardcoded
+fallback. It previously defaulted to a constant committed to this repository,
+which meant any deployment that omitted the variable produced a chain whose
+HMACs any reader of the public source could recompute -- tamper-evident in
+form, but providing no actual tamper evidence.
+
+Resolution order:
+
+* ``LEDGERLENS_AUDIT_SECRET`` set (>= 32 chars) -- used as-is.
+* Otherwise, in a production-flagged environment (``LEDGERLENS_ENV`` in
+  {production, prod, staging}, or ``NETWORK=mainnet``) -- raise
+  :class:`AuditSecretError` and refuse to run.
+* Otherwise (local development) -- generate a random secret once and persist it
+  to a machine-local, gitignored file beside the database. Random rather than
+  constant, so it is not derivable from the source tree; persisted rather than
+  per-process, so a chain written before a restart still verifies after it.
+
+Key rotation
+------------
+The chain is signed, not merely hashed, so **rotating the secret invalidates
+verification of every entry written under the old key**. There is no way around
+this without re-signing history, which would defeat the point of the chain. The
+supported procedure is therefore to seal rather than re-sign:
+
+1. Stop writers and run ``verify_chain`` under the *old* secret; keep the result
+   as the integrity attestation for that segment.
+2. Archive the existing ``audit_log.db`` read-only alongside that attestation
+   and a note of the rotation time.
+3. Start a fresh chain (new genesis entry) under the new secret.
+
+Verifying pre-rotation history then means verifying the archived segment with
+the archived key. Treat a rotation as a compliance event and record it.
+
 Event types logged:
     - ``score_computed``       — a risk score was computed for a wallet
     - ``api_key_used``         — an API key was used to access the system
@@ -18,6 +53,17 @@ Event types logged:
     - ``suppression_rule_added``   — a suppression rule was added
     - ``suppression_rule_removed`` — a suppression rule was removed
     - ``audit_chain_verified`` — the full chain was verified (integrity self-check)
+    - ``break_glass_admin_action`` — a sensitive admin action, carrying a
+      mandatory ``justification`` that is covered by the entry HMAC
+
+Relationship to other audit modules: this module is the general-purpose,
+system-wide audit trail (API key usage, admin config changes, suppression
+rule changes, and a coarse ``score_computed`` marker) chained with
+HMAC-SHA256. It is distinct from ``audit.scoring_events``, which is a
+dedicated, event-sourced audit log specifically for scoring *decisions* —
+it stores the full feature snapshot and model version behind each score
+and supports replaying the score from its events; see ``docs/audit_log.md``
+for its design rationale and chain-hash specification.
 """
 
 import hashlib
@@ -25,7 +71,9 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -39,17 +87,118 @@ logger = logging.getLogger("ledgerlens.audit_log")
 DEFAULT_DB_NAME = "audit_log.db"
 GENESIS_PREV_HASH = "genesis"
 AUDIT_SECRET_ENV_KEY = "LEDGERLENS_AUDIT_SECRET"
-_DEFAULT_AUDIT_SECRET = "ledgerlens-audit-default-secret-do-not-use-in-prod"
+
+# Which deployments must refuse to start without a real signing secret.
+# NETWORK=mainnet is honoured too, so an existing mainnet deployment is
+# covered without having to also set LEDGERLENS_ENV.
+ENVIRONMENT_ENV_KEY = "LEDGERLENS_ENV"
+NETWORK_ENV_KEY = "NETWORK"
+_PRODUCTION_ENVIRONMENTS = frozenset({"production", "prod", "staging"})
+
+# Filename of the machine-local development secret. Generated on first use and
+# never committed — see the module docstring.
+DEV_SECRET_FILENAME = ".ledgerlens_audit_secret"
+
+# Short keys weaken the HMAC and are almost always a placeholder that escaped
+# review; 32 characters is the smallest value worth trusting here.
+MIN_AUDIT_SECRET_LENGTH = 32
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+class InvalidEventSignatureError(ValueError):
+    """Raised when a scoring event reaches the audit log unsigned or tampered."""
+
+
+class AuditSecretError(RuntimeError):
+    """Raised when no trustworthy audit-chain signing secret is available.
+
+    Deliberately fatal. A tamper-evident chain signed with a key an attacker
+    can obtain is not tamper-evident, so continuing without a real secret would
+    produce audit history that merely looks verified.
+    """
+
+
+def is_production_environment() -> bool:
+    """True when this deployment must not fall back to a generated secret."""
+    env = os.getenv(ENVIRONMENT_ENV_KEY, "").strip().lower()
+    if env in _PRODUCTION_ENVIRONMENTS:
+        return True
+    return os.getenv(NETWORK_ENV_KEY, "").strip().lower() == "mainnet"
+
+
+def _dev_secret_path() -> Path:
+    """Machine-local path for the generated development secret."""
+    return Path(_default_db_path()).parent / DEV_SECRET_FILENAME
+
+
+def _load_or_create_dev_secret() -> str:
+    """Return a persistent, machine-local, randomly generated dev secret.
+
+    Persisted rather than per-process so that a chain written before a restart
+    still verifies afterwards, and generated rather than hardcoded so that it
+    is not derivable from the public source tree.
+    """
+    path = _dev_secret_path()
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # unreadable path — fall through to a fresh secret
+        logger.warning("Could not read %s (%s); generating a fresh one", path, exc)
+
+    secret = secrets.token_urlsafe(48)
+    try:
+        path.write_text(secret, encoding="utf-8")
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError as exc:
+        # An ephemeral secret still beats a public constant; it only means the
+        # chain will not verify across restarts on this machine.
+        logger.warning("Could not persist dev audit secret to %s (%s)", path, exc)
+    logger.warning(
+        "%s is not set. Generated a machine-local development audit secret at %s. "
+        "This is for local use only; set %s explicitly in any shared or "
+        "production deployment.",
+        AUDIT_SECRET_ENV_KEY,
+        path,
+        AUDIT_SECRET_ENV_KEY,
+    )
+    return secret
+
+
 def _get_audit_secret() -> bytes:
-    """Return the HMAC key from the environment (or a dev-only default)."""
-    secret = os.getenv(AUDIT_SECRET_ENV_KEY, _DEFAULT_AUDIT_SECRET)
-    return secret.encode("utf-8")
+    """Return the HMAC key, failing fast rather than using a guessable default.
+
+    The previous implementation fell back to a constant committed to this
+    repository, so any deployment that omitted the environment variable
+    produced a chain whose HMACs any reader of the public source could
+    recompute — tamper-evident in form only.
+    """
+    secret = os.getenv(AUDIT_SECRET_ENV_KEY, "").strip()
+
+    if secret:
+        if len(secret) < MIN_AUDIT_SECRET_LENGTH:
+            raise AuditSecretError(
+                f"{AUDIT_SECRET_ENV_KEY} must be at least "
+                f"{MIN_AUDIT_SECRET_LENGTH} characters; got {len(secret)}."
+            )
+        return secret.encode("utf-8")
+
+    if is_production_environment():
+        raise AuditSecretError(
+            f"{AUDIT_SECRET_ENV_KEY} is required when {ENVIRONMENT_ENV_KEY} is a "
+            f"production environment or {NETWORK_ENV_KEY}=mainnet. Refusing to "
+            f"sign the audit chain with a generated key: audit history signed "
+            f"with a key that is not under operator control cannot be trusted. "
+            f"Generate one with: python -c \"import secrets; "
+            f"print(secrets.token_urlsafe(48))\""
+        )
+
+    return _load_or_create_dev_secret().encode("utf-8")
 
 
 def _canonical_json(record: dict) -> bytes:
@@ -59,7 +208,13 @@ def _canonical_json(record: dict) -> bytes:
 
 def _compute_entry_hash(record: dict) -> str:
     """Compute ``entry_hash = HMAC-SHA256(key, canonical_json(record_without_hash))``."""
-    entry = {k: v for k, v in record.items() if k != "entry_hash"}
+    # ``justification`` is only part of the signed payload when present, so
+    # entries written before the column existed still verify unchanged.
+    entry = {
+        k: v
+        for k, v in record.items()
+        if k != "entry_hash" and not (k == "justification" and v is None)
+    }
     key = _get_audit_secret()
     return hmac.new(key, _canonical_json(entry), hashlib.sha256).hexdigest()
 
@@ -88,10 +243,14 @@ def init_db(db_path: Optional[str] = None) -> None:
                 wallet      TEXT,
                 score       INTEGER,
                 prev_hash   TEXT    NOT NULL,
-                entry_hash  TEXT    NOT NULL UNIQUE
+                entry_hash  TEXT    NOT NULL UNIQUE,
+                justification TEXT
             )
             """
         )
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(audit_log)")}
+        if "justification" not in columns:
+            conn.execute("ALTER TABLE audit_log ADD COLUMN justification TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log (event_type)"
         )
@@ -141,6 +300,7 @@ def append_entry(
     wallet: Optional[str] = None,
     score: Optional[int] = None,
     db_path: Optional[str] = None,
+    justification: str | None = None,
 ) -> dict:
     """Append a single entry to the audit log and return it as a dict.
 
@@ -165,13 +325,15 @@ def append_entry(
             "wallet": wallet,
             "score": score,
             "prev_hash": prev_hash,
+            "justification": justification,
         }
         entry["entry_hash"] = _compute_entry_hash(entry)
 
         conn.execute(
             """
-            INSERT INTO audit_log (timestamp, event_type, actor, wallet, score, prev_hash, entry_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audit_log
+                (timestamp, event_type, actor, wallet, score, prev_hash, entry_hash, justification)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry["timestamp"],
@@ -181,6 +343,7 @@ def append_entry(
                 entry["score"],
                 entry["prev_hash"],
                 entry["entry_hash"],
+                entry["justification"],
             ),
         )
         conn.commit()
@@ -213,8 +376,8 @@ def verify_chain(db_path: Optional[str] = None) -> list[dict]:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash "
-            "FROM audit_log ORDER BY id ASC"
+            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash, "
+            "justification FROM audit_log ORDER BY id ASC"
         ).fetchall()
     finally:
         conn.close()
@@ -232,6 +395,7 @@ def verify_chain(db_path: Optional[str] = None) -> list[dict]:
             score,
             prev_hash,
             entry_hash,
+            justification,
         ) = row
 
         record = {
@@ -241,6 +405,7 @@ def verify_chain(db_path: Optional[str] = None) -> list[dict]:
             "wallet": wallet,
             "score": score,
             "prev_hash": prev_hash,
+            "justification": justification,
         }
         computed_hash = _compute_entry_hash(record)
 
@@ -289,6 +454,27 @@ def is_chain_intact(db_path: Optional[str] = None) -> bool:
     return all(r["error"] is None for r in verify_chain(db_path))
 
 
+def verify_and_alert(db_path: Optional[str] = None) -> list[dict]:
+    """Verify the chain and raise an alert for every broken entry.
+
+    Used by the scheduled verification job and the admin API/CLI. Alerts are
+    emitted as CRITICAL log records (routed to the alerting pipeline) and as
+    the ``ledgerlens_audit_chain_broken_entries`` Prometheus gauge.
+
+    Returns the list of failing entries (empty when the chain is intact).
+    """
+    failures = [r for r in verify_chain(db_path) if r["error"] is not None]
+    for failure in failures:
+        logger.critical("[audit] Audit log chain break detected: %s", failure["error"])
+    try:
+        from api.metrics import audit_chain_broken_entries
+
+        audit_chain_broken_entries.set(len(failures))
+    except Exception:  # metrics are best-effort
+        pass
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Convenience event loggers
 # ---------------------------------------------------------------------------
@@ -302,6 +488,29 @@ def log_score_computed(
 ) -> dict:
     """Log a score-computed event."""
     return append_entry("score_computed", actor, wallet=wallet, score=score, db_path=db_path)
+
+
+def ingest_scoring_event(event, db_path: str | None = None) -> dict:
+    """Verify a scoring event's custody signature, then log it.
+
+    ``event`` is an ``audit.scoring_events.ScoringEvent`` or its ``to_dict``
+    form as received from transport. Unsigned or tampered events raise
+    :class:`InvalidEventSignatureError` and are never written.
+    """
+    from audit.scoring_events import ScoringEvent
+
+    if isinstance(event, dict):
+        event = ScoringEvent.from_row(event)
+    if not event.verify_signature():
+        raise InvalidEventSignatureError(
+            f"Rejected scoring event {event.event_id}: missing or invalid signature"
+        )
+    return log_score_computed(
+        event.actor_id or event.triggered_by,
+        event.wallet,
+        event.score,
+        db_path=db_path,
+    )
 
 
 def log_api_key_used(
@@ -336,6 +545,17 @@ def log_suppression_rule_removed(
     return append_entry("suppression_rule_removed", actor, db_path=db_path)
 
 
+def log_break_glass_action(
+    actor: str,
+    justification: str,
+    db_path: str | None = None,
+) -> dict:
+    """Log a break-glass (sensitive) admin action with its justification."""
+    return append_entry(
+        "break_glass_admin_action", actor, justification=justification, db_path=db_path
+    )
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -348,8 +568,8 @@ def get_all_entries(db_path: Optional[str] = None) -> list[dict]:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash "
-            "FROM audit_log ORDER BY id ASC"
+            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash, "
+            "justification FROM audit_log ORDER BY id ASC"
         ).fetchall()
         return [
             {
@@ -361,6 +581,7 @@ def get_all_entries(db_path: Optional[str] = None) -> list[dict]:
                 "score": r[5],
                 "prev_hash": r[6],
                 "entry_hash": r[7],
+                "justification": r[8],
             }
             for r in rows
         ]

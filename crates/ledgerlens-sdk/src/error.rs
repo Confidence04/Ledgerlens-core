@@ -1,6 +1,26 @@
-use std::fmt;
+use alloc::string::{String, ToString};
+use core::fmt;
 
 /// Errors that can occur when using the LedgerLens client.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ledgerlens_sdk::{LedgerLensClient, LedgerLensError};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let client = LedgerLensClient::new("https://api.ledgerlens.io", None);
+///     match client.get_score("GABCDEF").await {
+///         Ok(response) => println!("Got {} scores", response.scores.len()),
+///         Err(LedgerLensError::NotFound(_)) => eprintln!("Wallet not found"),
+///         Err(LedgerLensError::Unauthorized(_)) => eprintln!("Invalid API key"),
+///         Err(LedgerLensError::RateLimited(_)) => eprintln!("Rate limit exceeded; back off"),
+///         Err(LedgerLensError::HttpError(msg)) => eprintln!("Network error: {}", msg),
+///         Err(e) => eprintln!("Other error: {}", e),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum LedgerLensError {
     /// HTTP request failed (network error, DNS resolution failure, etc.)
@@ -22,6 +42,7 @@ pub enum LedgerLensError {
     TlsError(String),
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for LedgerLensError {}
 
 impl fmt::Display for LedgerLensError {
@@ -44,6 +65,7 @@ impl fmt::Display for LedgerLensError {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<reqwest::Error> for LedgerLensError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_status() {
@@ -92,7 +114,7 @@ pub enum ZkVerifyError {
     InvalidThreshold(u32),
 }
 
-#[cfg(feature = "zk-verify")]
+#[cfg(all(feature = "zk-verify", feature = "std"))]
 impl std::error::Error for ZkVerifyError {}
 
 #[cfg(feature = "zk-verify")]

@@ -159,9 +159,16 @@ def train(
     from detection.model_training import save_models, train_ensemble
     from ingestion.synthetic_data import generate_synthetic_dataset
 
+    logger.info(
+        "Generating synthetic dataset (%d normal accounts, %d wash rings of size %d)...",
+        n_normal_accounts,
+        n_wash_rings,
+        ring_size,
+    )
     trades, account_metadata, events, labels = generate_synthetic_dataset(
         n_normal_accounts=n_normal_accounts, n_wash_rings=n_wash_rings, ring_size=ring_size, seed=seed
     )
+    logger.info("Building training dataset from %d trades...", len(trades))
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     # Save training dataset for drift detection reference
@@ -170,7 +177,13 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
-    results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
+    logger.info("Training RF/XGBoost/LightGBM ensemble on %d rows...", len(df))
+    results = train_ensemble(
+        df,
+        calibrate=calibrate,
+        experiment_name=experiment_name,
+        random_state=seed,
+    )
     for name, result in results.items():
         if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
             continue
@@ -210,7 +223,12 @@ def generate_model_card_cli(
 
         typer.echo(f"Model card generated for {model} v{version} at {md_path}")
     except Exception as e:
-        typer.echo(f"Error generating model card: {e}", err=True)
+        typer.echo(
+            f"Error: could not generate a model card for --model={model!r} "
+            f"--version={version!r} ({e}). Check that this model/version was "
+            "actually trained and exists in settings.model_dir.",
+            err=True,
+        )
         raise typer.Exit(1)
 
 
@@ -607,7 +625,11 @@ def score_bulk(
     try:
         df_in = pd.read_csv(input)
     except Exception as exc:
-        typer.echo(f"Error reading CSV: {exc}", err=True)
+        typer.echo(
+            f"Error: could not parse {input} as CSV ({exc}). "
+            "Expected a comma-separated file with a 'wallet' column header.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     if "wallet" not in df_in.columns:
@@ -752,6 +774,13 @@ def historical_load(
     async def run() -> None:
         worker_count = concurrency or cfg.historical_loader_concurrency
         hours = chunk_hours or cfg.historical_chunk_hours
+        logger.info(
+            "Starting historical load %s -> %s (concurrency=%d, chunk_hours=%.2f)...",
+            start_time.isoformat(),
+            end_time.isoformat(),
+            worker_count,
+            hours,
+        )
         async with RetryingHorizonClient(
             cfg.horizon_url,
             max_concurrency=worker_count,
@@ -843,6 +872,13 @@ def export_parquet(
             db_conn=conn,
             output_dir=Path(output_dir),
             compression=compression,
+        )
+        logger.info(
+            "Exporting trades to %s (since=%s, until=%s, force=%s)...",
+            output_dir,
+            since_date,
+            until_date,
+            force,
         )
         result = exporter.export(
             since=since_date,
@@ -1311,6 +1347,75 @@ def dlq_replay(
     typer.echo(f"DLQ replay complete: {replayed} replayed, {failed} failed out of {len(items)} items.")
 
 
+trade_dlq_app = typer.Typer(help="Trade ingestion dead-letter queue: list, inspect, replay")
+app.add_typer(trade_dlq_app, name="trade-dlq")
+
+
+@trade_dlq_app.command("list")
+def trade_dlq_list(
+    status: str | None = typer.Option(None, help="pending | replayed | dead | quarantined"),
+    source: str | None = typer.Option(None, help="Filter by ingestion source"),
+    limit: int = typer.Option(50, help="Max entries to show"),
+) -> None:
+    """List trade DLQ entries and print depth / oldest-entry age."""
+    from ingestion.dlq import TradeDLQ
+
+    dlq = TradeDLQ()
+    for e in dlq.list_entries(status=status, source=source, limit=limit):
+        typer.echo(
+            f"{e.id}\t{e.status}\t{e.error_class.value}\t{e.source}\t"
+            f"failures={e.replay_failures}\t{e.created_at.isoformat()}\t{e.error_message}"
+        )
+    stats = dlq.refresh_metrics()
+    typer.echo(
+        f"depth={stats['depth']} quarantined={stats['quarantined']} "
+        f"oldest_age_seconds={stats['oldest_age_seconds']:.0f}"
+    )
+
+
+@trade_dlq_app.command("inspect")
+def trade_dlq_inspect(entry_id: int = typer.Argument(..., help="DLQ entry id")) -> None:
+    """Show a single trade DLQ entry including its raw record."""
+    import dataclasses
+    import json
+
+    from ingestion.dlq import TradeDLQ
+
+    entry = TradeDLQ().get(entry_id)
+    if entry is None:
+        typer.echo(f"DLQ entry {entry_id} not found.", err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(dataclasses.asdict(entry), default=str, indent=2))
+
+
+@trade_dlq_app.command("replay")
+def trade_dlq_replay(
+    entry_ids: list[int] = typer.Argument(..., help="DLQ entry ids to replay"),
+    handler: str = typer.Option(
+        ..., help="Replay handler as 'module:function', called with the decoded record"
+    ),
+) -> None:
+    """Replay selected trade DLQ entries; repeated failures are quarantined with an alert."""
+    import importlib
+
+    from ingestion.dlq import TradeDLQ
+
+    module_name, _, func_name = handler.partition(":")
+    if not func_name:
+        typer.echo("--handler must be in 'module:function' form.", err=True)
+        raise typer.Exit(2)
+    fn = getattr(importlib.import_module(module_name), func_name)
+    dlq = TradeDLQ()
+    failed = 0
+    for entry_id in entry_ids:
+        outcome = dlq.replay(entry_id, fn)
+        failed += outcome.status != "replayed"
+        typer.echo(f"{entry_id}\t{outcome.status}" + (f"\t{outcome.error}" if outcome.error else ""))
+    dlq.refresh_metrics()
+    if failed:
+        raise typer.Exit(1)
+
+
 @app.command("governance-close-expired")
 def governance_close_expired() -> None:
     """Close all active governance proposals whose voting period has expired.
@@ -1376,7 +1481,7 @@ def reweight(
 
 @app.command("sign-models")
 def sign_models(
-    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+    model_dir: str = typer.Option(None, help="Directory of .joblib model files to sign (defaults to settings.model_dir)"),
 ) -> None:
     """Backfill HMAC-SHA256 signatures for every .joblib in model_dir.
 
@@ -1457,7 +1562,7 @@ def generate_signing_key() -> None:
 
 @app.command("verify-models")
 def verify_models(
-    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+    model_dir: str = typer.Option(None, help="Directory of .joblib model files to verify (defaults to settings.model_dir)"),
 ) -> None:
     """Verify all model artifacts in MODEL_DIR using ED25519 signatures. Exits non-zero if any fail."""
     from config.settings import settings
@@ -1577,6 +1682,18 @@ def compute_embeddings(
     typer.echo(f"Stored embeddings for {len(wallet_ids)} wallets with version {model_version}")
 
 
+@app.command("lineage-model")
+def lineage_model(
+    model: str = typer.Argument(..., help="Model name, version, or versioned model dataset name"),
+) -> None:
+    """Query the training data and feature versions that produced a model."""
+    import json
+
+    from detection.lineage import get_model_lineage
+
+    typer.echo(json.dumps(get_model_lineage(model), indent=2, sort_keys=True))
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
@@ -1684,6 +1801,10 @@ def federated_server(
     min_participants: int = typer.Option(None, help="Minimum quorum size before aggregation"),
 ) -> None:
     """Start the federated aggregation server as a standalone process."""
+    logger.warning(
+        "[DEPRECATED] `cli.py federated server` is deprecated and will be removed in a future release. "
+        "Please use the standalone package `ledgerlens-fl-server` instead."
+    )
     import uvicorn
 
     from config.settings import settings as cfg
@@ -1720,7 +1841,11 @@ def federated_admit(
     """
     from detection.federated.admission import admit_participant
 
-    record = admit_participant(participant_id, max_n_samples, admitted_by, db_path=db_path)
+    try:
+        record = admit_participant(participant_id, max_n_samples, admitted_by, db_path=db_path)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
     typer.echo(
         f"Admitted {record.participant_id!r}: max_n_samples={record.max_n_samples}, "
         f"admitted_by={record.admitted_by!r}, admitted_at={record.admitted_at}"
@@ -1909,6 +2034,9 @@ def red_team(
     evasion_threshold: float = typer.Option(0.05, help="Maximum allowed evasion rate (5%)"),
     report_dir: str = typer.Option("./red_team_reports", help="Directory to write campaign reports"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    record: bool = typer.Option(
+        True, help="Record the result against each model's current version (see model_registry)"
+    ),
 ) -> None:
     """Run automated red-team attack campaigns and exit 1 if any campaign fails (CI gate)."""
     from detection.model_inference import load_models
@@ -1935,6 +2063,16 @@ def red_team(
     for c in summary.campaigns:
         typer.echo(f"  {c.attack_type.value}: evasion_rate={c.evasion_rate:.3f} {'OK' if c.passed else 'FAIL'}")
 
+    if record:
+        from detection.model_registry import get_current_version, record_red_team_result
+
+        for pointer in sorted(Path(model_dir).glob("*_latest.txt")):
+            name = pointer.name[: -len("_latest.txt")]
+            version = get_current_version(name, model_dir)
+            if version:
+                record_red_team_result(name, version, model_dir, summary.to_dict())
+                typer.echo(f"Recorded red-team result for {name} v{version}")
+
     if not summary.passed:
         raise typer.Exit(1)
 
@@ -1944,6 +2082,25 @@ app.add_typer(config_app, name="config")
 
 db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
+
+audit_app = typer.Typer(help="Audit log commands")
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("verify")
+def audit_verify(
+    db_path: str = typer.Option(None, "--db-path", help="Path to the audit log database"),
+) -> None:
+    """Verify the audit log hash chain; exit 1 if any entry was tampered with."""
+    from storage.audit_log import verify_and_alert
+
+    failures = verify_and_alert(db_path)
+    if failures:
+        for failure in failures:
+            typer.echo(failure["error"], err=True)
+        typer.echo(f"Chain broken: {len(failures)} entry(ies) failed verification")
+        raise typer.Exit(1)
+    typer.echo("Audit log chain intact")
 
 
 @db_app.command("retention")
@@ -1957,11 +2114,22 @@ def db_retention(
     Default TTLs: risk_scores=365d, feature_vectors=90d, alerts=730d.
     Use --dry-run to preview the archival plan without modifying the database.
     """
+    import sqlite3
+
     from config.settings import settings as cfg
     from storage.retention import RetentionEngine
 
-    engine = RetentionEngine(db_path=db_path or cfg.db_path, archive_root=archive_root)
-    report = engine.run(dry_run=dry_run)
+    resolved_db_path = db_path or cfg.db_path
+    engine = RetentionEngine(db_path=resolved_db_path, archive_root=archive_root)
+    try:
+        report = engine.run(dry_run=dry_run)
+    except sqlite3.OperationalError as exc:
+        typer.echo(
+            f"Error: could not open database at --db-path={resolved_db_path!r} ({exc}). "
+            "Check that the path exists and its parent directory is writable.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     prefix = "[DRY RUN] " if dry_run else ""
     for table, info in report.items():
@@ -2158,7 +2326,11 @@ def dedup_audit(
         if since_dt.tzinfo is None:
             since_dt = since_dt.replace(tzinfo=timezone.utc)
     except Exception as e:
-        typer.echo(f"Invalid ISO-8601 datetime for --since: {e}", err=True)
+        typer.echo(
+            f"Invalid ISO-8601 datetime for --since: {e}. "
+            "Use a format like 2026-07-17T00:00:00Z.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     since_str = since_dt.isoformat()
@@ -2253,6 +2425,30 @@ def re_encrypt_webhook_secrets() -> None:
     typer.echo(f"Re-encryption complete. Successfully re-encrypted {reencrypted_count} webhook secrets under the current encryption key.")
 
 
+@app.command("event-bus-replay")
+def event_bus_replay(
+    limit: int = typer.Option(None, help="Maximum number of dead-lettered events to replay (default: all)"),
+    list_only: bool = typer.Option(False, "--list", help="List dead-lettered events without replaying them"),
+) -> None:
+    """Replay risk-score events dead-lettered by the internal event bus.
+
+    Run after the underlying Kafka/NATS fault is fixed. Successfully replayed
+    events are removed from the dead-letter store; failures stay for a retry.
+    """
+    from detection.event_bus import get_dead_letter_store, get_event_bus
+
+    store = get_dead_letter_store()
+    if list_only:
+        for entry in store.entries(limit=limit):
+            typer.echo(f"{entry.id}\t{entry.backend}\t{entry.created_at}\tattempts={entry.replay_attempts}\t{entry.error}")
+        typer.echo(f"{store.count()} dead-lettered event(s).")
+        return
+
+    result = get_event_bus().replay_dead_letters(store, limit=limit)
+    typer.echo(f"Replayed {result.replayed}, failed {result.failed}, remaining {result.remaining}.")
+    if result.failed:
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
-

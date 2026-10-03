@@ -14,12 +14,13 @@ import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import pandas as pd
 
 from config.settings import get_runtime_risk_score_threshold, settings
 from config.correlation import set_correlation_id
 from config.telemetry import get_tracer
+from detection.amm_engine import amm_round_trips_to_alerts, detect_profitable_pool_round_trips
 from detection.cross_pair_engine import (
     build_volume_time_series,
     find_correlated_pairs,
@@ -31,7 +32,11 @@ from detection.feature_store import FeatureStore
 from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
 from detection.path_cycle_detector import detect_cycles_from_payments, path_payment_cycles_to_alerts
-from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.path_payment_engine import (
+    detect_atomic_circular_routes,
+    detect_path_payment_sandwiches,
+    path_payment_sandwiches_to_alerts,
+)
 from detection.event_bus import get_event_bus
 from detection.risk_score import RiskScore
 from detection.storage import (
@@ -169,7 +174,7 @@ def _maybe_flush_feature_store_to_cold() -> None:
             logger.warning(f"Failed to flush feature store to cold storage: {e}")
 
 
-def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict) -> None:
+def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict[str, Any]) -> None:
     temporal_model = models.get("temporal_lstm")
     if temporal_model is None:
         return
@@ -201,23 +206,49 @@ def run(
 ) -> list[RiskScore]:
     """Run one scoring pass over the given asset pairs and return the resulting scores.
 
-    `asset_pairs` is a list of `(base_asset, counter_asset)` tuples in
-    `CODE:ISSUER` form (None for native XLM). Defaults to a single
-    XLM/USDC pair for local testing.
+    This is the main entry point for the detection pipeline. See
+    `README.md` for a high-level architecture overview; the stages
+    performed here, in order, are:
 
-    When `multi_pair=True`, trades for all pairs are loaded upfront and
-    cross-asset correlation analysis is performed once across all pairs.
-    The resulting cross-pair features are included in each account's
-    feature vector.
+    1. Load trade history (and, when configured, merge in Solana SPL
+       swap trades) for each asset pair, plus order book events and
+       path payments.
+    2. Build a transaction graph and detect wash-trading rings and
+       circular/path-payment routes.
+    3. Build a per-account feature vector and score it with the trained
+       models (optionally including GNN wash-ring probabilities and
+       conformal-prediction uncertainty intervals).
+    4. Persist scores, rings, feature vectors, and SHAP explanations,
+       and record features for drift detection.
+    5. Enqueue webhook alerts for matching subscribers.
+    6. Submit high-risk scores on-chain to the Soroban contract.
 
-    When ``use_uncertainty=True`` (default), loads calibration artifacts
-    and includes conformal prediction intervals in the returned scores.
-    Falls back silently if no calibration artifacts are found.
+    Parameters:
+        asset_pairs: list of `(base_asset, counter_asset)` tuples in
+            `CODE:ISSUER` form (None for native XLM). Defaults to a
+            single XLM/USDC pair for local testing.
+        multi_pair: when True, trades for all pairs are loaded upfront
+            and cross-asset correlation analysis is performed once
+            across all pairs. The resulting cross-pair features are
+            included in each account's feature vector.
+        no_submit: when True, skips step 6 (on-chain submission) even
+            if a Soroban contract is configured.
+        use_uncertainty: when True (default), loads calibration
+            artifacts and includes conformal prediction intervals in
+            the returned scores. Falls back silently if no calibration
+            artifacts are found.
+
+    Side effects: performs network calls (Stellar/Soroban RPC, and
+    Solana RPC if configured), writes to the database (scores, rings,
+    feature vectors, SHAP values, path payments/cycles), publishes to
+    the event bus, enqueues webhook alerts, and — unless `no_submit`
+    is set — submits transactions on-chain for scores at or above the
+    risk threshold.
     """
     # Assign a fresh correlation ID for this pipeline pass
     set_correlation_id(str(uuid.uuid4()))
 
-    from api.metrics import pipeline_run_duration_seconds, wallets_scored_total, scoring_latency_seconds
+    from api.metrics import benford_flags_total, pipeline_run_duration_seconds, wallets_scored_total, scoring_latency_seconds
 
     tracer = get_tracer("ledgerlens.pipeline")
     _t_start = time.monotonic()
@@ -311,9 +342,17 @@ def run(
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
                 save_liquidity_pool_trades(pool_trades)
+                save_alerts(
+                    amm_round_trips_to_alerts(detect_profitable_pool_round_trips(pool_trades))
+                )
 
             path_payments = load_path_payments_for_accounts(list(accounts), since)
             save_path_payments(path_payments)
+            save_alerts(
+                path_payment_sandwiches_to_alerts(
+                    detect_path_payment_sandwiches(path_payments)
+                )
+            )
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
             path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
@@ -385,6 +424,8 @@ def run(
                     scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
                     _result = "above_threshold" if score.score >= get_runtime_risk_score_threshold() else "below_threshold"
                     wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
+                    if score.benford_flag:
+                        benford_flags_total.labels(asset_pair=pair_key).inc()
                 r.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="feature_distribution_snapshots"))
 
         logger.info("Computed %d risk scores", len(scores))
@@ -439,10 +480,14 @@ def _enqueue_webhook_alerts(scores: list[RiskScore]) -> None:
         from detection.webhook_queue import enqueue, init_db as init_q
         from detection.webhook_registry import get_matching_subscribers, init_db as init_r
 
+        from detection.tracing import ensure_trace_id
+
         init_r()
         init_q()
+        trace_id = ensure_trace_id()
         for score in scores:
             payload = score.model_dump()
+            payload["trace_id"] = trace_id
             payload["score_lower"] = score.score_lower
             payload["score_upper"] = score.score_upper
             for sub in get_matching_subscribers(score):
@@ -536,12 +581,20 @@ async def async_run(
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
                 save_liquidity_pool_trades(pool_trades)
+                save_alerts(
+                    amm_round_trips_to_alerts(detect_profitable_pool_round_trips(pool_trades))
+                )
 
             path_payments_per_account = await asyncio.gather(
                 *(async_load_path_payments(account, since, client) for account in accounts)
             )
             path_payments = [p for payments in path_payments_per_account for p in payments]
             save_path_payments(path_payments)
+            save_alerts(
+                path_payment_sandwiches_to_alerts(
+                    detect_path_payment_sandwiches(path_payments)
+                )
+            )
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
             path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
@@ -691,11 +744,11 @@ def run_streaming(
 
 def _flush_streaming_buffer(
     buffer: list[Trade],
-    models: dict,
+    models: dict[str, Any],
     pair_key: str,
     asset_pair: tuple[str | None, str | None],
     cursor: str,
-    calibrators: dict | None = None,
+    calibrators: dict[str, Any] | None = None,
 ) -> None:
     """Score all accounts in *buffer* and persist results + cursor."""
     if not buffer:

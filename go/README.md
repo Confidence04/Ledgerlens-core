@@ -4,13 +4,21 @@ Idiomatic Go client for the [LedgerLens](https://github.com/Ledger-Lenz/Ledgerle
 
 Covers the same REST surface as the Python SDK (`packages/ledgerlens-sdk`) and the TypeScript SDK (`sdk/`), with context-aware methods, typed error handling, and webhook HMAC verification helpers.
 
+## Requirements
+
+Go 1.22 or later, matching the `go` directive in [`go.mod`](./go.mod). CI builds and tests this SDK against Go 1.22.
+
 ## Installation
 
 ```bash
 go get github.com/Ledger-Lenz/Ledgerlens-core/go@latest
 ```
 
-Requires Go 1.22+. The module path is `github.com/Ledger-Lenz/Ledgerlens-core/go`.
+The module path is `github.com/Ledger-Lenz/Ledgerlens-core/go`.
+
+### Minimum supported Go version
+
+This module requires **Go 1.22 or later**, matching the `go 1.22` directive in `go.mod`. CI builds and tests the SDK against Go 1.22.
 
 ## Quick Start
 
@@ -43,6 +51,21 @@ func main() {
 }
 ```
 
+## Runnable Examples
+
+[`example_test.go`](example_test.go) contains runnable, testable examples using
+Go's `Example` function convention. They execute against a local `httptest`
+server, so they are verified on every `go test ./...` run and also render in the
+generated [pkg.go.dev](https://pkg.go.dev) documentation:
+
+- `Example` — construct a client and fetch a wallet's risk scores.
+- `Example_withdrawalGating` — the withdrawal-gating pattern shown below.
+
+```bash
+cd go/
+go test -run Example -v ./...
+```
+
 ## Withdrawal Gating Example
 
 A common exchange-backend pattern: block a withdrawal when the wallet's risk
@@ -72,6 +95,7 @@ func checkWithdrawalAllowed(ctx context.Context, client *ledgerlens.Client, wall
 | `WithHTTPClient(hc)` | Replaces the default `*http.Client` |
 | `WithTimeout(d)` | Sets the per-request timeout (default: 30 s) |
 | `WithInsecureSkipVerify()` | Disables TLS verification — **test servers only** |
+| `WithRetryPolicy(p)` | Enables retry with exponential backoff for idempotent requests (see below) |
 
 ## Methods
 
@@ -114,6 +138,32 @@ if err != nil {
     return err
 }
 ```
+
+## Cancellation and Retries
+
+Every method takes a `context.Context`. Cancelling it (or letting its deadline
+pass) aborts the in-flight request and any pending retry backoff immediately,
+returning `context.Canceled` / `context.DeadlineExceeded`.
+
+Retries are disabled by default and enabled with `WithRetryPolicy`:
+
+```go
+client := ledgerlens.NewClient(baseURL, ledgerlens.WithRetryPolicy(ledgerlens.RetryPolicy{
+    MaxAttempts:    3,                      // total attempts, including the first
+    InitialBackoff: 500 * time.Millisecond, // default
+    MaxBackoff:     30 * time.Second,       // default
+}))
+```
+
+The semantics are consistent with the shared LedgerLens Python HTTP client
+(`ingestion/http_client.py`):
+
+- Only idempotent methods (`GET`, `HEAD`, `DELETE`) are retried; `POST`
+  (e.g. `RegisterWebhook`) is never retried.
+- Only transport errors and HTTP 429, 500, 502, 503 and 504 are retried; other
+  4xx responses fail immediately.
+- Delays use exponential backoff with full jitter, capped at `MaxBackoff`.
+  A `Retry-After` header on a 429 response takes precedence (also capped).
 
 ## Webhook Verification
 
@@ -204,3 +254,5 @@ The module is tagged `go/vX.Y.Z` for `go get`:
 ```bash
 go get github.com/Ledger-Lenz/Ledgerlens-core/go@go/v0.1.0
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the version history of this module.

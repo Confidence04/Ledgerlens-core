@@ -17,9 +17,33 @@
  * ```
  */
 
+/**
+ * {@link LedgerLensClient} is the HTTP client; {@link LedgerLensError} is the
+ * error type every client method rejects with.
+ */
 export { LedgerLensClient, LedgerLensError } from "./client";
+/** Constructor options for {@link LedgerLensClient}. */
 export type { LedgerLensClientOptions } from "./client";
 
+/**
+ * {@link LedgerLensAlertStream} consumes `/ws/alerts` with automatic
+ * reconnect (exponential backoff + jitter) and transparent resubscription.
+ */
+export { LedgerLensAlertStream } from "./stream";
+export type {
+  LedgerLensAlertStreamOptions,
+  ConnectionState,
+  ConnectionStateEvent,
+  RiskScoreAlert,
+  WebSocketLike,
+  WebSocketFactory,
+} from "./stream";
+
+/**
+ * Zod schemas backing every API response. Exported so consumers can run their
+ * own validation, derive partial schemas, or reuse them in tests. Each
+ * `XxxSchema` parses the payload described by the matching `Xxx` type below.
+ */
 export {
   // Schemas (for custom validation)
   StellarAddressSchema,
@@ -33,11 +57,17 @@ export {
   CounterfactualSchema,
   WebhookSubscriberSchema,
   HealthSchema,
-  PaginatedScoresSchema,
   ApiErrorSchema,
 } from "./schemas";
+export {
+  PageCursorSchema,
+  PaginatedScoresSchema,
+} from "./generated/pagination";
 
-// Types
+/**
+ * Static types inferred from the Zod schemas above, describing the shape of
+ * each parsed API response.
+ */
 export type {
   RiskScore,
   Alert,
@@ -49,6 +79,6 @@ export type {
   Counterfactual,
   WebhookSubscriber,
   Health,
-  PaginatedScores,
   ApiError,
 } from "./schemas";
+export type { PageCursor, PaginatedScores } from "./generated/pagination";

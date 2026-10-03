@@ -9,25 +9,15 @@ Starting from v2, the schema includes optional uncertainty fields
 (``score_lower``, ``score_upper``, ``prediction_set``, ``coverage_guarantee``)
 populated by ``ConformalCalibrator`` during inference.
 
-Starting from v3, the schema includes a ``score_version`` field that pins the
-aggregation formula semantics.  Downstream consumers (API, SDKs, on-chain
-publisher) MUST propagate this field unchanged.  A change to the aggregation
-formula REQUIRES a version bump — enforced by the golden-file regression test
-at ``tests/test_score_version_contract.py``.
-
-Versioned aggregation contract
--------------------------------
-``SCORE_VERSION = "3"``
-
-Formula (weights are the stable contract):
-  base_component   = 0.3 * benford_component + 0.7 * ml_component
-  sandwich_blend   = (1 - sandwich_weight) * base + sandwich_weight * sandwich_component
-  copula_blend     = (1 - copula_weight)   * sandwich_blend + copula_weight * copula_component
-  causal_adjust    = pdc_score * pdc_discount_weight  (subtracted from copula_blend)
-  final_score      = clamp(copula_blend - causal_adjust, 0, 100)
-
-Any change to these weights, operations, or clamp bounds MUST increment
-``SCORE_VERSION`` and regenerate ``tests/score_version_golden.json``.
+On-chain publication decision (issue #941): the calibrated uncertainty
+interval is published **API-only** and is intentionally *not* written to the
+on-chain `RiskScore` struct. Rationale: (1) the interval is derived from a
+calibration set that is periodically refit, so publishing it on-chain would
+require a contract upgrade and re-attestation on every refit; (2) on-chain
+consumers act on the point score for settlement/gating, while the interval is
+advisory metadata for off-chain consumers reasoning about score reliability;
+(3) keeping the bounds off-chain avoids bloating per-wallet on-chain state.
+The point ``score`` remains the canonical on-chain value.
 """
 
 from __future__ import annotations
@@ -113,10 +103,9 @@ class RiskScore(BaseModel):
 
         Optional uncertainty fields (``score_lower``, ``score_upper``,
         ``prediction_set``, ``coverage_guarantee``) are passed through to
-        the returned ``RiskScore`` when provided.
-
-        The exact formula is the versioned contract documented in the module
-        docstring.  Do not change weights without bumping ``SCORE_VERSION``.
+        the returned ``RiskScore`` when provided. When only a conformal
+        interval is supplied, the bounds are clamped to the valid 0-100
+        range and ordered so ``score_lower <= score_upper``.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -135,6 +124,13 @@ class RiskScore(BaseModel):
         causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight
         score = round(max(0.0, score - causal_adjustment))
         score = max(0, min(100, score))
+
+        if score_lower is not None and score_upper is not None:
+            lo = max(0.0, min(100.0, float(score_lower)))
+            hi = max(0.0, min(100.0, float(score_upper)))
+            if lo > hi:
+                lo, hi = hi, lo
+            score_lower, score_upper = lo, hi
 
         return cls(
             wallet=wallet,

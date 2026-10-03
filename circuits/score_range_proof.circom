@@ -16,6 +16,11 @@ template Bn254CondAdd() {
     signal output x3;
     signal output y3;
 
+    // Constrain bit to be boolean so the conditional select below is
+    // well-defined; without this the witness could pick an arbitrary field
+    // element and the accumulator would be under-constrained.
+    bit * (bit - 1) === 0;
+
     signal lambda;
     lambda <-- (y2 - y1) / (x2 - x1);
     lambda * (x2 - x1) === y2 - y1;
@@ -28,8 +33,12 @@ template Bn254CondAdd() {
     y3_add <-- lambda * (x1 - x3_add) - y1;
     y3_add === lambda * (x1 - x3_add) - y1;
 
+    // Constrain the conditional selection so x3/y3 are fully determined by
+    // the inputs (previously only assigned via <--, leaving them free).
     x3 <-- x1 + bit * (x3_add - x1);
+    x3 === x1 + bit * (x3_add - x1);
     y3 <-- y1 + bit * (y3_add - y1);
+    y3 === y1 + bit * (y3_add - y1);
 }
 
 // Add two points on BN254 G1 natively
@@ -59,20 +68,28 @@ template ScoreRangeProof(maxScore) {
     signal input commitY;        // public
     signal input threshold;      // public
 
-    // 1. Bit decompose score (7 bits) and blinding (254 bits)
+    // 1. Bit decompose score (7 bits) and blinding (254 bits).
+    // This both range-checks score into [0, 127] (see docs/zk_snark_range_proof.md,
+    // "Range Check") and produces the bits consumed by the double-and-add
+    // accumulators below to recompute the Pedersen commitment.
     component scoreBits = Num2Bits(7);
     scoreBits.in <== score;
 
     component blindingBits = Num2Bits(254);
     blindingBits.in <== blinding;
 
-    // Dummy point D = 2 * G (precomputed in constants.circom as get_G_pow2(1))
+    // Dummy point D = 2 * G (precomputed in constants.circom as get_G_pow2(1)).
+    // Accumulation starts from D instead of the curve identity because the
+    // native Bn254Add/Bn254CondAdd formulas are undefined at the point at
+    // infinity; D is subtracted back out in step 4 before the final equality check.
     signal dx;
     signal dy;
     dx <-- get_G_pow2_x(1);
     dy <-- get_G_pow2_y(1);
 
-    // 2. Accumulate G points for score
+    // 2. Accumulate score * G via conditional double-and-add: for each bit i,
+    // add G*2^i to the running sum only if scoreBits.out[i] is 1. After the
+    // loop, score_x/y[7] holds D + score*G.
     signal score_x[8];
     signal score_y[8];
     score_x[0] <== dx;
@@ -90,7 +107,9 @@ template ScoreRangeProof(maxScore) {
         score_y[i+1] <== scoreAdd[i].y3;
     }
 
-    // 3. Accumulate H points for blinding
+    // 3. Continue the same conditional double-and-add for blinding * H,
+    // chained onto the score accumulator. After the loop, blinding_x/y[254]
+    // holds D + score*G + blinding*H, i.e. D plus the full Pedersen commitment.
     signal blinding_x[255];
     signal blinding_y[255];
     blinding_x[0] <== score_x[7];
@@ -108,7 +127,11 @@ template ScoreRangeProof(maxScore) {
         blinding_y[i+1] <== blindingAdd[i].y3;
     }
 
-    // 4. Verify C + D === Accumulator
+    // 4. Verify C + D === Accumulator, i.e. that the public commitment
+    // (commitX, commitY) equals score*G + blinding*H. This is the
+    // "Pedersen Commitment Binding" property from docs/zk_snark_range_proof.md:
+    // it ties the private score/blinding witnesses to the public commitment
+    // without revealing either private value.
     component finalAdd = Bn254Add();
     finalAdd.x1 <== commitX;
     finalAdd.y1 <== commitY;
@@ -118,7 +141,9 @@ template ScoreRangeProof(maxScore) {
     finalAdd.x3 === blinding_x[254];
     finalAdd.y3 === blinding_y[254];
 
-    // 5. Enforce score >= threshold
+    // 5. Enforce score >= threshold. This is the "Threshold Enforcement"
+    // property from docs/zk_snark_range_proof.md: it proves the committed
+    // score meets the public threshold without revealing the exact score.
     component geq = GreaterEqThan(8);
     geq.in[0] <== score;
     geq.in[1] <== threshold;

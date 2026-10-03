@@ -66,6 +66,32 @@ def _make_robustness_df() -> pd.DataFrame:
     return df
 
 
+def test_similarity_index_rebuilds_on_model_version_change(tmp_path, monkeypatch):
+    from api import main as api_main
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+
+    monkeypatch.setattr(settings, "embedding_store_path", str(tmp_path / "embeddings.db"))
+    monkeypatch.setattr(api_main, "_embedding_store", None)
+    monkeypatch.setattr(api_main, "_vector_index", None)
+    monkeypatch.setattr(api_main, "_model_version", None)
+    monkeypatch.setattr(api_main, "_indexed_embedding_revision", None)
+    monkeypatch.setattr(api_main, "_vector_index_refreshed_at", None)
+
+    store = EmbeddingStore()
+    store.upsert_embedding("GABC", "gnn_v1", np.ones(64, dtype=np.float32))
+    api_main._initialize_vector_resources()
+    first_index = api_main._vector_index
+    assert api_main._model_version == "gnn_v1"
+    assert first_index.size() == 1
+
+    store.upsert_embedding("GDEF", "gnn_v2", np.zeros(64, dtype=np.float32))
+    api_main._initialize_vector_resources()
+    assert api_main._model_version == "gnn_v2"
+    assert api_main._vector_index is not first_index
+    assert api_main._vector_index.size() == 1
+
+
 # ---------------------------------------------------------------------------
 # Robustness endpoint tests (admin-key gated, dependency-override pattern)
 # ---------------------------------------------------------------------------
@@ -279,6 +305,24 @@ def test_list_scores_and_filter_by_min_score(client):
     body = response.json()
     assert len(body) == 1
     assert body[0]["wallet"] == "G" + "A" * 55
+
+
+@pytest.mark.parametrize("min_score", [0, 50, 100])
+def test_list_scores_accepts_min_score_within_bounds(client, min_score):
+    response = client.get("/v1/scores", params={"min_score": min_score})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("min_score", [-5, 101])
+def test_list_scores_rejects_min_score_outside_bounds(client, min_score):
+    response = client.get("/v1/scores", params={"min_score": min_score})
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"][-1] == "min_score"
+        for error in response.json()["detail"]
+    )
 
 
 def test_list_scores_filters_by_benford_flag(client):
@@ -821,3 +865,37 @@ def test_legacy_scores_redirects(client):
     assert response.status_code == 302
     assert "/v1/scores" in response.headers["location"]
     assert "min_score=50" in response.headers["location"]
+
+
+def test_get_scores_min_score_bounds(client):
+    """Test GET /v1/scores min_score parameter bounds validation (#682)."""
+    # Valid min_score values (200 OK)
+    response_valid_zero = client.get("/v1/scores?min_score=0")
+    assert response_valid_zero.status_code == 200
+
+    response_valid_hundred = client.get("/v1/scores?min_score=100")
+    assert response_valid_hundred.status_code == 200
+
+    # Out-of-bounds min_score values (422 Unprocessable Entity)
+    response_below = client.get("/v1/scores?min_score=-5")
+    assert response_below.status_code == 422
+
+    response_above = client.get("/v1/scores?min_score=101")
+    assert response_above.status_code == 422
+
+
+def test_list_scores_min_score_bounds_validation(client):
+    """Verify GET /v1/scores validates min_score bounds [0, 100] (Issue #682)."""
+    # Valid min_score queries (should return 200 OK)
+    res_valid_zero = client.get("/v1/scores?min_score=0")
+    assert res_valid_zero.status_code in (200, 404)  # 200 or 404 depending on db state, not 422
+
+    res_valid_100 = client.get("/v1/scores?min_score=100")
+    assert res_valid_100.status_code in (200, 404)
+
+    # Out-of-bounds min_score queries (must return 422 Unprocessable Entity)
+    res_invalid_negative = client.get("/v1/scores?min_score=-5")
+    assert res_invalid_negative.status_code == 422
+
+    res_invalid_high = client.get("/v1/scores?min_score=101")
+    assert res_invalid_high.status_code == 422

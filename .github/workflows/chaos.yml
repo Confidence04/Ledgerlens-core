@@ -1,6 +1,10 @@
 name: Chaos Engineering
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     # Weekly on Monday at 02:00 UTC
@@ -23,11 +27,53 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Create .env for docker compose
+        # The api container only reads settings from .env / its own defaults —
+        # a step-level `env:` on `docker compose up` is visible to the compose
+        # CLI process, not forwarded into the container. LEDGERLENS_DB_PATH is
+        # intentionally left unset here so the container's default
+        # ("./ledgerlens.db", i.e. /app/ledgerlens.db) matches the file the
+        # next step creates and docker-compose.yml bind-mounts.
+        run: |
+          cp .env.example .env
+          echo "LEDGERLENS_ADMIN_API_KEY=test-admin-key" >> .env
+          # .env.example defaults to redis://localhost:6379/0, which inside
+          # the api container refers to the container itself, not the
+          # sibling "redis" service. Override with the compose service name.
+          echo "REDIS_URL=redis://redis:6379/0" >> .env
+          # Must match the key the next step trains and signs models with,
+          # or the container fails to verify/load them at startup.
+          echo "LEDGERLENS_MODEL_SIGNING_KEY=chaos-ci-test-signing-key" >> .env
+
+      - name: Train models docker-compose bind-mounts into the container
+        # docker-compose.yml bind-mounts ./models into the container, and
+        # /health returns 503 (failing the compose healthcheck) if any
+        # expected model file is missing — the API's own doc for /health
+        # says as much: "Run model_training first."
+        run: python cli.py train --n-normal-accounts 200 --n-wash-rings 30
+        env:
+          # Newer mlflow refuses its legacy filesystem tracking backend
+          # (the ./mlruns dir train_ensemble logs to) unless this is set.
+          MLFLOW_ALLOW_FILE_STORE: "true"
+          # Saving a trained model HMAC-signs it; any non-empty secret works
+          # for this throwaway CI run.
+          LEDGERLENS_MODEL_SIGNING_KEY: "chaos-ci-test-signing-key"
+
+      - name: Create the SQLite database docker-compose bind-mounts
+        # docker-compose.yml bind-mounts ./ledgerlens.db into the container;
+        # if the host file doesn't already exist, Docker creates an empty
+        # *directory* there instead, and the API fails to open it as a
+        # database. Running the migration first creates a real file with the
+        # expected schema, at the same path the API defaults to.
+        run: |
+          python cli.py db-migrate --db-path ./ledgerlens.db
+          # The container runs as a non-root user (uid 1000) whose uid won't
+          # generally match the runner user that just created this file, so
+          # make sure it's writable by anyone before it's bind-mounted in.
+          chmod 666 ./ledgerlens.db
+
       - name: Start chaos services (Toxiproxy + Redis + API)
         run: docker compose --profile chaos up -d --wait
-        env:
-          LEDGERLENS_ADMIN_API_KEY: test-admin-key
-          LEDGERLENS_DB_PATH: /tmp/ledgerlens_chaos.db
 
       - name: Wait for API to be healthy
         run: |
@@ -37,10 +83,12 @@ jobs:
           done
 
       - name: Run chaos test suite
+        # Talks to the same database the containerized API uses, so
+        # assertions that read the DB directly see what the API wrote.
         run: pytest tests/chaos/ -m chaos -v --tb=short --timeout=120
         env:
           LEDGERLENS_ADMIN_API_KEY: test-admin-key
-          LEDGERLENS_DB_PATH: /tmp/ledgerlens_chaos.db
+          LEDGERLENS_DB_PATH: ./ledgerlens.db
           REDIS_URL: redis://localhost:6379/0
 
       - name: Collect docker logs on failure

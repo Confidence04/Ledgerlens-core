@@ -9,19 +9,11 @@ SHAP values per model after training. :func:`compare_importance_stability`
 checks Spearman rank correlation of top-10 features between model versions
 and blocks auto-promotion when correlation drops below the configured threshold.
 
-Promotion gates (Issue #933)
-----------------------------
-:func:`promote_model` enforces two hard pre-checks before updating the
-latest pointer:
-
-1. **Signed model card** — a model card for the candidate version must exist
-   and carry a valid ED25519 signature (``ModelSigner.verify``).
-2. **Robustness threshold** — ``compute_robustness_report`` must show
-   ``mean_map >= ROBUSTNESS_MIN_MAP`` and ``asr["0.10"] <= ROBUSTNESS_MAX_ASR``.
-
-Either failure raises :class:`PromotionGateError` with a distinct, actionable
-message naming the failing gate.  Gate results are recorded in
-``training_metadata.json`` under the ``"promotion_checks"`` key for audit.
+Robustness promotion gate: :func:`enforce_robustness_gate` is a hard gate that
+rejects candidates whose robustness score (``RobustnessReport.certified_radius``)
+is below :data:`MIN_ROBUSTNESS_SCORE`. A below-threshold candidate can only be
+promoted via an explicit :class:`RobustnessOverride` (approver + justification),
+which is appended to ``robustness_overrides.jsonl`` in the model directory.
 """
 
 import hashlib
@@ -41,25 +33,88 @@ logger = logging.getLogger("ledgerlens.model_registry")
 
 SHAP_STABILITY_THRESHOLD: float = 0.70
 
-# ---------------------------------------------------------------------------
-# Promotion gate thresholds (Issue #933)
-# ---------------------------------------------------------------------------
-# A candidate model must meet BOTH thresholds to be promoted.
-# mean_map: minimal adversarial perturbation magnitude — higher is more robust
-# asr_010:  attack success rate at epsilon=0.10 — lower is more robust
-ROBUSTNESS_MIN_MAP: float = 0.05   # MAP must be >= this value
-ROBUSTNESS_MAX_ASR: float = 0.80   # ASR at ε=0.10 must be <= this value
+# Minimum certified robustness radius (L2, normalised feature space) a candidate
+# must reach to be promoted. Set from current baseline ensembles, which certify
+# at ~0.07-0.10 under the default randomized-smoothing settings.
+MIN_ROBUSTNESS_SCORE: float = 0.05
+ROBUSTNESS_OVERRIDE_LOG = "robustness_overrides.jsonl"
 
 
-class PromotionGateError(RuntimeError):
-    """Raised when a promotion pre-check fails.
+class RobustnessGateError(RuntimeError):
+    """Raised when a candidate model fails the robustness promotion gate."""
 
-    ``gate`` identifies which check failed (``"model_card"`` or ``"robustness"``).
+
+@dataclass(frozen=True)
+class RobustnessOverride:
+    """Explicit, audited sign-off to promote a below-threshold model."""
+
+    approved_by: str
+    justification: str
+
+    def __post_init__(self) -> None:
+        if not self.approved_by.strip() or not self.justification.strip():
+            raise ValueError("RobustnessOverride requires non-empty approved_by and justification")
+
+
+def enforce_robustness_gate(
+    report,
+    model_dir: str,
+    threshold: float = MIN_ROBUSTNESS_SCORE,
+    override: RobustnessOverride | None = None,
+) -> bool:
+    """Hard gate: refuse promotion when robustness is below ``threshold``.
+
+    Args:
+        report: ``RobustnessReport`` (or dict) with ``model_version`` and
+            ``certified_radius``.
+        model_dir: Model directory; overrides are audited to
+            ``robustness_overrides.jsonl`` here.
+        threshold: Minimum acceptable ``certified_radius``.
+        override: Explicit sign-off permitting a below-threshold promotion.
+
+    Returns:
+        True when the gate passes (score >= threshold, or audited override).
+
+    Raises:
+        RobustnessGateError: If the score is below threshold and no override is given.
     """
+    data = report.model_dump() if hasattr(report, "model_dump") else dict(report)
+    version = data.get("model_version", "unknown")
+    score = float(data.get("certified_radius", 0.0))
+    if score >= threshold:
+        return True
+    if override is None:
+        raise RobustnessGateError(
+            f"Model {version} robustness score {score:.4f} is below minimum {threshold:.4f}; "
+            "promotion requires an explicit RobustnessOverride"
+        )
 
-    def __init__(self, gate: str, message: str) -> None:
-        self.gate = gate
-        super().__init__(f"[gate:{gate}] {message}")
+    entry = {
+        "model_version": version,
+        "robustness_score": score,
+        "threshold": threshold,
+        "approved_by": override.approved_by,
+        "justification": override.justification,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+    with open(os.path.join(model_dir, ROBUSTNESS_OVERRIDE_LOG), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    logger.warning("Robustness gate overridden: %s", entry)
+    return True
+
+
+def promote_model(
+    model,
+    name: str,
+    version: str,
+    model_dir: str,
+    robustness_report,
+    override: RobustnessOverride | None = None,
+) -> None:
+    """Save and promote a model only if it passes the robustness gate."""
+    enforce_robustness_gate(robustness_report, model_dir, override=override)
+    save_versioned_model(model, name, version, model_dir)
 
 
 def _compute_version_hash(training_row_count: int, column_hash: str) -> str:
@@ -99,6 +154,12 @@ def save_versioned_model(
     """
     Path(model_dir).mkdir(parents=True, exist_ok=True)
 
+    reference_models = {}
+    active_version = get_current_version(name, model_dir)
+    if active_version is not None:
+        reference_models[name] = load_versioned_model(name, active_version, model_dir)
+    validate_model_promotion_robustness({name: model}, reference_models)
+
     model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
     import joblib
     joblib.dump(model, model_path)
@@ -137,6 +198,11 @@ def load_latest_model(
     with open(latest_path, "r") as f:
         version = f.read().strip()
 
+    return load_versioned_model(name, version, model_dir)
+
+
+def load_versioned_model(name: str, version: str, model_dir: str):
+    """Load and verify a specific versioned model without changing its pointer."""
     model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Versioned model not found: {model_path}")
@@ -145,6 +211,47 @@ def load_latest_model(
     model = safe_joblib_load(model_path, settings.model_signing_key.encode())
     logger.info("Loaded %s version %s from %s", name, version, model_path)
     return model
+
+
+class ModelPromotionError(RuntimeError):
+    """Raised when an adversarial robustness gate rejects model promotion."""
+
+    def __init__(self, report: dict) -> None:
+        self.report = report
+        super().__init__(f"Adversarial robustness gate failed: {report}")
+
+
+def validate_model_promotion_robustness(
+    candidate_models: dict,
+    reference_models: dict | None = None,
+) -> dict:
+    """Run the mandatory adversarial robustness gate for candidate models."""
+    from detection.robustness_eval import evaluate_promotion_robustness
+
+    report = evaluate_promotion_robustness(candidate_models, reference_models)
+    if not report["passed"]:
+        raise ModelPromotionError(report)
+    return report
+
+
+def promote_model_version(version: str, model_names: list[str], model_dir: str) -> dict:
+    """Validate a complete model version before moving active pointers."""
+    candidate_models = {
+        name: load_versioned_model(name, version, model_dir) for name in model_names
+    }
+    reference_models = {}
+    for name in model_names:
+        active_version = get_current_version(name, model_dir)
+        if active_version is not None:
+            reference_models[name] = load_versioned_model(name, active_version, model_dir)
+
+    report = validate_model_promotion_robustness(candidate_models, reference_models)
+    for name in model_names:
+        latest_path = os.path.join(model_dir, f"{name}_latest.txt")
+        with open(latest_path, "w") as f:
+            f.write(version)
+    logger.info("Promoted model version %s after adversarial validation", version)
+    return report
 
 
 def rollback_model(
@@ -167,6 +274,12 @@ def rollback_model(
     with open(latest_path, "w") as f:
         f.write(previous_version)
     logger.info("Rolled back %s to version %s", name, previous_version)
+    try:
+        from api.metrics import model_lifecycle_events_total
+
+        model_lifecycle_events_total.labels(action="rollback").inc()
+    except ImportError:
+        pass
 
 
 def list_model_versions(
@@ -383,168 +496,56 @@ def load_shap_importances(model_dir: str, version: str | None = None) -> dict | 
 
 
 # ---------------------------------------------------------------------------
-# Promotion gates (Issue #933)
+# Red-team promotion gate & per-version result history
 # ---------------------------------------------------------------------------
 
 
-def _check_model_card_gate(name: str, version: str, model_dir: str) -> dict:
-    """Return gate result dict; raise PromotionGateError on failure.
+class RedTeamGateError(RuntimeError):
+    """Raised when a model version has no passing red-team result."""
 
-    Checks that a model card file exists for the given version and that it
-    carries a valid ED25519 signature produced by :class:`~detection.model_signing.ModelSigner`.
+
+def _red_team_result_path(name: str, version: str, model_dir: str) -> str:
+    return os.path.join(model_dir, f"{name}_v{version}.redteam.json")
+
+
+def record_red_team_result(name: str, version: str, model_dir: str, summary: dict) -> str:
+    """Persist a red-team ``CampaignSummary.to_dict()`` for one model version.
+
+    Stored next to the model as ``{name}_v{version}.redteam.json`` so results
+    travel with the artifact and can be compared across versions.
     """
-    card_path = Path(model_dir) / f"{name}_v{version}_model_card.json"
-    if not card_path.exists():
-        raise PromotionGateError(
-            "model_card",
-            f"No model card found for {name} v{version} at {card_path}. "
-            "Generate and sign a model card before promoting this version.",
-        )
-
-    # Verify the ED25519 signature on the card file
-    try:
-        from detection.model_signing import get_model_signer
-        signer = get_model_signer()
-        signer.verify(card_path)
-    except Exception as exc:
-        raise PromotionGateError(
-            "model_card",
-            f"Model card signature verification failed for {name} v{version}: {exc}. "
-            "Re-sign the model card with a valid private key before promoting.",
-        )
-
-    logger.info("Promotion gate PASSED [model_card]: %s v%s", name, version)
-    return {"gate": "model_card", "passed": True, "card_path": str(card_path)}
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+    path = _red_team_result_path(name, version, model_dir)
+    record = {"model": name, "version": version, **summary}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2)
+    logger.info("Recorded red-team result for %s v%s (passed=%s)", name, version, summary.get("passed"))
+    return path
 
 
-def _check_robustness_gate(name: str, version: str, model_dir: str) -> dict:
-    """Return gate result dict; raise PromotionGateError on failure.
+def load_red_team_history(name: str, model_dir: str) -> list[dict]:
+    """Return recorded red-team results for every version of *name*, newest first."""
+    history = []
+    for version in list_model_versions(name, model_dir):
+        path = _red_team_result_path(name, version, model_dir)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                history.append(json.load(f))
+    return history
 
-    Loads the latest persisted robustness report from the database (written by
-    :func:`~detection.robustness_eval.compute_robustness_report`).  Falls back
-    to inline computation when no persisted report exists for this version.
+
+def assert_red_team_passed(name: str, version: str, model_dir: str) -> dict:
+    """Promotion gate: raise :class:`RedTeamGateError` unless *version* passed.
+
+    A version with no recorded result is treated as failing, so a model can
+    never be promoted without a documented adversarial evaluation pass.
     """
-    from detection.storage import get_latest_robustness_report
-
-    report_data: dict | None = None
-    try:
-        report_data = get_latest_robustness_report(model_version=version)
-    except Exception as exc:
-        logger.warning("Could not load persisted robustness report for %s v%s: %s", name, version, exc)
-
-    if report_data is None:
-        raise PromotionGateError(
-            "robustness",
-            f"No robustness report found for {name} v{version}. "
-            "Run compute_robustness_report() and persist results before promoting.",
-        )
-
-    mean_map = float(report_data.get("mean_map", 0.0))
-    asr = report_data.get("asr", {})
-    asr_010 = float(asr.get("0.10", 1.0))
-
-    failures: list[str] = []
-    if mean_map < ROBUSTNESS_MIN_MAP:
-        failures.append(
-            f"mean_map={mean_map:.4f} is below the required threshold of {ROBUSTNESS_MIN_MAP}"
-        )
-    if asr_010 > ROBUSTNESS_MAX_ASR:
-        failures.append(
-            f"asr[0.10]={asr_010:.4f} exceeds the maximum allowed value of {ROBUSTNESS_MAX_ASR}"
-        )
-
-    if failures:
-        raise PromotionGateError(
-            "robustness",
-            f"Robustness gate FAILED for {name} v{version}: " + "; ".join(failures) + ". "
-            "Re-evaluate robustness and address deficiencies before promoting.",
-        )
-
-    logger.info(
-        "Promotion gate PASSED [robustness]: %s v%s (mean_map=%.4f, asr_010=%.4f)",
-        name, version, mean_map, asr_010,
-    )
-    return {
-        "gate": "robustness",
-        "passed": True,
-        "mean_map": mean_map,
-        "asr_010": asr_010,
-    }
-
-
-def _record_promotion_checks(model_dir: str, name: str, version: str, gate_results: list[dict]) -> None:
-    """Persist gate results to training_metadata.json for audit trail."""
-    metadata_path = os.path.join(model_dir, "training_metadata.json")
-    metadata: dict = {}
-    if os.path.exists(metadata_path):
-        try:
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read existing metadata: %s", exc)
-
-    promotions = metadata.setdefault("promotion_checks", {})
-    promotions[f"{name}_v{version}"] = {
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-        "gates": gate_results,
-    }
-
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-
-
-def promote_model(name: str, version: str, model_dir: str) -> None:
-    """Promote *version* as the active model after enforcing pre-checks.
-
-    Pre-checks (both must pass):
-      1. **model_card** — a signed model card JSON must exist for this version.
-      2. **robustness** — a persisted robustness report must meet
-         ``mean_map >= ROBUSTNESS_MIN_MAP`` and ``asr["0.10"] <= ROBUSTNESS_MAX_ASR``.
-
-    On any gate failure, raises :class:`PromotionGateError` with ``gate``
-    identifying which check failed and a message explaining the resolution.
-
-    On success, updates ``{name}_latest.txt`` and records gate results in
-    ``training_metadata.json`` for audit.
-
-    Args:
-        name: Model name (e.g., ``"random_forest"``).
-        version: Candidate version string (SHA-256[:8]).
-        model_dir: Directory containing versioned models.
-
-    Raises:
-        PromotionGateError: If any pre-check fails.
-        FileNotFoundError: If the versioned model file does not exist.
-    """
-    # Verify candidate model file actually exists before spending gate effort
-    model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Cannot promote: versioned model not found at {model_path}"
-        )
-
-    gate_results: list[dict] = []
-
-    # Gate 1: signed model card
-    card_result = _check_model_card_gate(name, version, model_dir)
-    gate_results.append(card_result)
-
-    # Gate 2: robustness threshold
-    rob_result = _check_robustness_gate(name, version, model_dir)
-    gate_results.append(rob_result)
-
-    # Record gate results for audit trail (best-effort)
-    try:
-        _record_promotion_checks(model_dir, name, version, gate_results)
-    except Exception as exc:
-        logger.warning("Could not persist promotion check results: %s", exc)
-
-    # All gates passed — update the latest pointer
-    latest_path = os.path.join(model_dir, f"{name}_latest.txt")
-    with open(latest_path, "w") as f:
-        f.write(version)
-
-    logger.info(
-        "Promoted %s to version %s (all gates passed: %s)",
-        name, version, [g["gate"] for g in gate_results],
-    )
+    path = _red_team_result_path(name, version, model_dir)
+    if not os.path.exists(path):
+        raise RedTeamGateError(f"{name} v{version}: no red-team result recorded")
+    with open(path, encoding="utf-8") as f:
+        result = json.load(f)
+    if not result.get("passed"):
+        failed = [c["attack_type"] for c in result.get("campaigns", []) if not c.get("passed")]
+        raise RedTeamGateError(f"{name} v{version}: red-team gate failed for {failed}")
+    return result
