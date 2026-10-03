@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -1222,34 +1223,52 @@ class SimilarWalletsResponse(BaseModel):
 _vector_index: Optional[object] = None
 _embedding_store: Optional[object] = None
 _model_version: Optional[str] = None
+_indexed_embedding_revision: Optional[int] = None
+_vector_index_refreshed_at: Optional[float] = None
+_vector_resources_lock = threading.Lock()
 
 
 def _initialize_vector_resources():
-    """Initialize the vector index and embedding store singletons."""
+    """Initialize or refresh the model-versioned vector index snapshot."""
     global _vector_index, _embedding_store, _model_version
-    from config.settings import settings
+    global _indexed_embedding_revision, _vector_index_refreshed_at
     from detection.embedding_store import EmbeddingStore
     from detection.vector_index import create_vector_index
     import numpy as np
 
-    if _embedding_store is None:
-        _embedding_store = EmbeddingStore()
+    with _vector_resources_lock:
+        if _embedding_store is None:
+            _embedding_store = EmbeddingStore()
 
-    # Get the latest model version
-    _model_version = _embedding_store.get_latest_model_version()
-    if _model_version is None:
-        return  # No embeddings yet
+        model_version, revision, embeddings = _embedding_store.get_index_snapshot()
+        if model_version is None:
+            _vector_index = None
+            _model_version = None
+            _indexed_embedding_revision = revision
+            _vector_index_refreshed_at = time.monotonic()
+            return
 
-    if _vector_index is None:
-        _vector_index = create_vector_index()
-        # Load all embeddings from the store
-        wallets = []
-        vectors = []
-        for wallet, embedding_bytes in _embedding_store.get_all_embeddings(_model_version):
-            wallets.append(wallet)
-            vectors.append(np.frombuffer(embedding_bytes, dtype=np.float32))
-        if vectors:
-            _vector_index.add_batch(wallets, np.array(vectors))
+        refresh_due = (
+            _vector_index_refreshed_at is None
+            or time.monotonic() - _vector_index_refreshed_at
+            >= settings.vector_index_refresh_seconds
+        )
+        if (
+            _vector_index is not None
+            and model_version == _model_version
+            and revision == _indexed_embedding_revision
+            and not refresh_due
+        ):
+            return
+
+        index = create_vector_index()
+        if embeddings:
+            wallets, vectors = zip(*embeddings)
+            index.add_batch(list(wallets), np.stack(vectors))
+        _vector_index = index
+        _model_version = model_version
+        _indexed_embedding_revision = revision
+        _vector_index_refreshed_at = time.monotonic()
 
 
 @v1_router.get(
@@ -1270,21 +1289,13 @@ def find_similar_wallets(
     - **503** — vector index not initialized.
     """
     from config.settings import settings
-    from detection.embedding_store import EmbeddingStore
-    from detection.vector_index import create_vector_index
-    import numpy as np
-
     validate_stellar_address(wallet)
 
     # Check rate limit
     client_ip = request.client.host if request.client else "127.0.0.1"
     _check_gnn_similarity_rate_limit(client_ip)
 
-    # Initialize resources if needed
-    if _embedding_store is None:
-        _initialize_vector_resources()
-    if _vector_index is None:
-        _initialize_vector_resources()
+    _initialize_vector_resources()
     if _embedding_store is None or _vector_index is None or _model_version is None:
         raise HTTPException(status_code=503, detail="Vector similarity index not available")
 
@@ -1734,6 +1745,20 @@ def get_lineage(dataset: str) -> dict:
     """Return the lineage graph for a named dataset or model version."""
     from detection.lineage import get_lineage_graph
     return get_lineage_graph(dataset)
+
+
+@v1_router.get(
+    "/admin/lineage/models/{model}",
+    tags=["Admin"],
+    summary="Query model training lineage",
+    description="Return data snapshots, feature schema versions, and artifacts used to produce a model.",
+    dependencies=[Depends(require_admin_key)],
+)
+def get_model_training_lineage(model: str) -> list[dict]:
+    """Query completed training lineage by model name, version, or dataset name."""
+    from detection.lineage import get_model_lineage
+
+    return get_model_lineage(model)
 
 
 @v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])

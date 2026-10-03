@@ -22,6 +22,8 @@ Output
     Saves encoder + classifier state dicts to ``models/gnn_ring_detector.pt``
     and a SHA-256 checksum to ``models/gnn_ring_detector.sha256``.
     In heterogeneous mode, saves to ``models/gnn_ring_detector_hetero.pt``.
+    A ``.training.json`` sidecar records the effective label fingerprint,
+    seed/configuration, learned-state hash, and checkpoint hash.
 """
 from __future__ import annotations
 
@@ -33,10 +35,13 @@ import os
 import random
 import sqlite3
 import sys
+from importlib.metadata import version
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("train_gnn")
@@ -70,7 +75,7 @@ def _compute_sha256(path: str) -> str:
 
 def _write_checksum(model_path: str) -> None:
     checksum = _compute_sha256(model_path)
-    checksum_path = model_path.replace(".pt", ".sha256")
+    checksum_path = str(Path(model_path).with_suffix(".sha256"))
     with open(checksum_path, "w") as f:
         f.write(checksum + "\n")
     logger.info("Checksum written to %s", checksum_path)
@@ -190,21 +195,27 @@ def _load_labels(db_path: str, neg_sample_ratio: int) -> tuple[list[str], list[s
         logger.warning("DB not found at %s — using empty labels.", db_path)
         return [], []
 
+    as_of = as_of or datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        raise ValueError("as_of must include a timezone")
+    as_of = as_of.astimezone(timezone.utc)
     conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
 
         # Positives
         try:
-            cursor.execute("SELECT wallet FROM ring_members WHERE confirmed = 1")
+            cursor.execute(
+                "SELECT wallet FROM ring_members WHERE confirmed = 1 ORDER BY wallet"
+            )
             positives = [row[0] for row in cursor.fetchall()]
         except sqlite3.OperationalError:
             logger.warning("ring_members table not found — no positive labels.")
             positives = []
 
         # Negatives: safe wallets not in any open alert in last 90 days
-        cutoff_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        cutoff_90d = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        cutoff_30d = (as_of - timedelta(days=30)).isoformat()
+        cutoff_90d = (as_of - timedelta(days=90)).isoformat()
         try:
             cursor.execute(
                 """
@@ -212,15 +223,17 @@ def _load_labels(db_path: str, neg_sample_ratio: int) -> tuple[list[str], list[s
                 FROM wallet_scores ws
                 WHERE ws.score < 20
                   AND ws.scored_at > ?
-                  AND ws.wallet NOT IN (
-                      SELECT DISTINCT wallet FROM alerts
-                      WHERE created_at > ?
-                  )
+                    AND ws.scored_at <= ?
+                    AND ws.wallet NOT IN (
+                        SELECT DISTINCT wallet FROM alerts
+                        WHERE created_at > ? AND created_at <= ?
+                    )
                   AND ws.wallet NOT IN ({pos_placeholders})
+                  ORDER BY ws.wallet
                 """.format(
                     pos_placeholders=",".join("?" * len(positives)) if positives else "'_none_'"
                 ),
-                [cutoff_30d, cutoff_90d] + positives,
+                [cutoff_30d, as_of.isoformat(), cutoff_90d, as_of.isoformat()] + positives,
             )
             negatives = [row[0] for row in cursor.fetchall()]
         except sqlite3.OperationalError:
@@ -232,6 +245,7 @@ def _load_labels(db_path: str, neg_sample_ratio: int) -> tuple[list[str], list[s
         n_neg = len(positives) * neg_sample_ratio
         if len(negatives) > n_neg:
             negatives = random.sample(negatives, n_neg)
+        negatives.sort()
 
         logger.info("Labels: %d positives, %d negatives", len(positives), len(negatives))
         return positives, negatives
@@ -239,7 +253,11 @@ def _load_labels(db_path: str, neg_sample_ratio: int) -> tuple[list[str], list[s
         conn.close()
 
 
-def _make_dummy_trades(wallets: list[str], n_trades: int = 50) -> list:
+def _make_dummy_trades(
+    wallets: list[str],
+    n_trades: int = 50,
+    reference_time: datetime | None = None,
+) -> list:
     """Generate synthetic Trade-like objects for graph construction during training."""
     from types import SimpleNamespace
 
@@ -338,6 +356,7 @@ def _train(
     conv_type:
         Convolution type for heterogeneous mode: ``"sage"`` or ``"hgt"``.
     """
+    import numpy as np
     import torch
     from sklearn.metrics import roc_auc_score
 
@@ -615,7 +634,9 @@ def _train(
                 "epochs_run": epoch,
                 "graph_mode": "heterogeneous",
                 "conv_type": conv_type,
-                "trained_at": datetime.now(timezone.utc).isoformat(),
+                "seed": seed,
+                "as_of": as_of.isoformat(),
+                "dataset_sha256": dataset_sha256,
             },
         }
     else:
@@ -636,12 +657,58 @@ def _train(
                 "n_negatives": len(negatives),
                 "epochs_run": epoch,
                 "graph_mode": "homogeneous",
-                "trained_at": datetime.now(timezone.utc).isoformat(),
+                "seed": seed,
+                "as_of": as_of.isoformat(),
+                "dataset_sha256": dataset_sha256,
             },
         }
 
     torch.save(checkpoint, model_path)
     _write_checksum(model_path)
+    state_digest = hashlib.sha256()
+    for component in ("encoder", "classifier"):
+        for name, tensor in sorted(checkpoint[component].items()):
+            state_digest.update(component.encode())
+            state_digest.update(name.encode())
+            state_digest.update(str(tensor.dtype).encode())
+            state_digest.update(str(tuple(tensor.shape)).encode())
+            state_digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    metadata_path = str(Path(model_path).with_suffix(".training.json"))
+    with open(metadata_path, "w") as metadata_file:
+        json.dump(
+            {
+                "model": os.path.basename(model_path),
+                "dataset_sha256": dataset_sha256,
+                "model_state_sha256": state_digest.hexdigest(),
+                "artifact_sha256": _compute_sha256(model_path),
+                "seed": seed,
+                "as_of": as_of.isoformat(),
+                "config": {
+                    "epochs": epochs,
+                    "lr": lr,
+                    "neg_sample_ratio": neg_sample_ratio,
+                    "patience": patience,
+                    "val_fraction": val_fraction,
+                    "hidden_channels": hidden_channels,
+                    "out_channels": out_channels,
+                    "num_layers": num_layers,
+                    "dropout": dropout,
+                    "graph_mode": graph_mode,
+                    "conv_type": conv_type,
+                },
+                "best_val_auc": best_val_auc,
+                "epochs_run": epoch,
+                "python_version": sys.version.split()[0],
+                "numpy_version": np.__version__,
+                "torch_version": torch.__version__,
+                "torch_geometric_version": version("torch-geometric"),
+                "scikit_learn_version": version("scikit-learn"),
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+            },
+            metadata_file,
+            indent=2,
+            sort_keys=True,
+        )
     logger.info("Model saved to %s (val_auc=%.4f, mode=%s)", model_path, best_val_auc, graph_mode)
 
     if current_mlflow_run_id:
@@ -754,6 +821,7 @@ def main():
             "Examples:\n"
             "  python scripts/train_gnn.py --epochs 50 --lr 0.001 --neg-sample-ratio 3\n"
             "  python scripts/train_gnn.py --graph-mode heterogeneous --conv-type hgt\n"
+            "  python scripts/train_gnn.py --seed 42 --as-of 2025-01-01T00:00:00+00:00\n"
             "  LEDGERLENS_DB_PATH=/data/ll.db python scripts/train_gnn.py\n"
         ),
     )
