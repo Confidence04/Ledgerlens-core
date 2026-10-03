@@ -205,9 +205,93 @@ This boundary covers training data, dependency sources, and model parameters.
 
 | Threat (STRIDE) | Scenario | Current Mitigation | Code Reference | Residual Risk | Recommended Mitigation |
 |---|---|---|---|---|---|
-| **S**poofing | A malicious dependency impersonates a trusted package. | Dependencies are pinned and sourced from trusted registries. | [requirements.txt](file:///c:/Users/HP/Ledgerlens-core/requirements.txt) | Medium | Add dependency signature verification. |
-| **T**ampering | A model artifact is tampered with before deployment. | Model artifacts are built and signed in CI; signatures are verified before loading. | [models/](file:///c:/Users/HP/Ledgerlens-core/models) | Medium | Enforce signature verification at load time. |
-| **R**epudiation | A build cannot be traced to its source commit. | Builds record the source commit and artifact hashes. | [.github/](file:///c:/Users/HP/Ledgerlens-core/.github) | Low | None. |
-| **I**nformation Disclosure | Training data or model parameters leak from CI logs. | CI logs are scrubbed of secrets; training data is access-controlled. | [.github/](file:///c:/Users/HP/Ledgerlens-core/.github) | Low | None. |
-| **D**enial of Service | A compromised CI job blocks releases. | CI jobs are isolated and bounded. | [.github/](file:///c:/Users/HP/Ledgerlens-core/.github) | Low | None. |
-| **E**levation of Privilege | A compromised dependency executes arbitrary code in CI. | CI runs with least privilege and no long-lived secrets. | [.github/](file:///c:/Users/HP/Ledgerlens-core/.github) | Medium | Add sandboxing for build steps. |
+| **S**poofing | An attacker places a malicious model file inside the distribution directory. | Model loading checks ED25519 signatures and verifies the files against the public key. | [docs/model_signing.md](file:///c:/Users/HP/Ledgerlens-core/docs/model_signing.md), [detection/model_signing.py](file:///c:/Users/HP/Ledgerlens-core/detection/model_signing.py) | Low | None. |
+| **T**ampering | A compromised build container overwrites a `.joblib` model with a payload executing arbitrary python shell code via `__reduce__`. | SHA-256 integrity digests are signed on build and verified before model deserialization. | [detection/model_signing.py](file:///c:/Users/HP/Ledgerlens-core/detection/model_signing.py) (`ModelSigner`) | Low | None. |
+| **R**epudiation | A contaminated model artifact cannot be traced to the build version that compiled it. | Load validation matches the public key embedded in source control, ensuring the model came from the training pipeline. | [docs/model_signing.md](file:///c:/Users/HP/Ledgerlens-core/docs/model_signing.md#L27-L30) | Low | None. |
+| **I**nformation Disclosure | Private keys used to sign models are exposed in build logs or source code. | Private key (`MODEL_SIGNING_PRIVATE_KEY`) is stored as an environment variable and is never written to disk. | [docs/model_signing.md](file:///c:/Users/HP/Ledgerlens-core/docs/model_signing.md#L27-L30) | Low | None. |
+| **D**enial of Service | Corrupted or missing signatures freeze scoring processes on reload. | The CI verification script checks model signatures during packaging to fail builds fast. | [docs/model_signing.md](file:///c:/Users/HP/Ledgerlens-core/docs/model_signing.md#L50-L57) | Low | None. |
+| **E**levation of Privilege | Compromised third-party dependencies are introduced into the runtime environment. | Strict package pinning in `requirements.txt`. | [requirements.txt](file:///c:/Users/HP/Ledgerlens-core/requirements.txt) | Medium — Outdated dependencies could introduce CVEs. | Implement Software Bill of Materials (SBOM) scanning and vulnerability alerts (scoped separately). |
+
+---
+
+## Risk Register
+
+| # | Threat | Boundary | Likelihood | Impact | Priority | Status | Code/Setting Reference |
+|---|---|---|---|---|---|---|---|
+| 1 | **Admin Key Compromise**: Compromise of admin API key grants access to retrain checkpoints and metrics. | Admin API Callers | Low | High | **High** | Mitigated | `ledgerlens_admin_api_key` in [config/settings.py](file:///c:/Users/HP/Ledgerlens-core/config/settings.py#L163) |
+| 2 | **Model Deserialization Hijack**: Malicious `.joblib` file replaces trained models to run arbitrary remote code. | CI/CD & Pipeline | Very Low | Critical | **High** | Mitigated | `verify_model_file` in [detection/model_signing.py](file:///c:/Users/HP/Ledgerlens-core/detection/model_signing.py) |
+| 3 | **Client Gradient Poisoning**: Byzantine clients submit skewed labels to bias wash-trading detection rules. | Federated Learning | Medium | Medium | **Medium** | Mitigated | `KrumStrategy` in [detection/federated/krum.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/krum.py) |
+| 4 | **Server Operator Inference**: Compromised aggregation server intercepts soft labels before noise injection. | Federated Learning | Low | Medium | **Medium** | Residual | `submit_update` in [detection/federated/server.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/server.py#L200) |
+| 5 | **RPC Data Spoofing**: Compromised public EVM RPC nodes return falsified event logs. | External Sources | Low | Medium | **Medium** | Residual | `evm_providers` in [config/settings.py](file:///c:/Users/HP/Ledgerlens-core/config/settings.py#L210) |
+| 6 | **SSRF Loopback Abuse**: Subscriber registers localhost or local subnets to query internal API endpoints. | Webhook Subscribers | Low | Medium | **Medium** | Mitigated | `verify_url` in [detection/webhook_registry.py](file:///c:/Users/HP/Ledgerlens-core/detection/webhook_registry.py) |
+| 7 | **Single-Key Oracle Compromise**: Attacker compromises a single key and submits falsified scores on-chain. | Soroban Chain | Low | Critical | **Medium** | Mitigated | `THRESHOLD` in [contracts/oracle_aggregator/src/lib.rs](file:///c:/Users/HP/Ledgerlens-core/contracts/oracle_aggregator/src/lib.rs#L40) |
+| 8 | **Webhook Replay Attack**: Intercepted webhook alert is replayed to trigger actions on subscriber contracts. | Webhook Subscribers | Medium | Low | **Low** | Mitigated | `X-LedgerLens-Timestamp` in [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L30) |
+
+---
+
+## Security Considerations
+
+### 1. Admin API Blast Radius (`LEDGERLENS_ADMIN_API_KEY`)
+The `LEDGERLENS_ADMIN_API_KEY` is a highly sensitive secret. Today, this key grants authorization to:
+- Scraping operational metrics containing queue depth and performance details (`/metrics`, `/stream/rate-limiter`).
+- Uploading label corrections via `POST /v1/feedback`, which influences future retraining iterations.
+- Accessing raw federated round audit records (`/admin/federated/audit-log`).
+- Resetting or triggering testing operations on smart contract wrappers (`/admin/soroban/health`, `/admin/soroban/reset`).
+
+**Recommendations**:
+- Restrict admin port access via firewall configurations to internal/localhost subnets.
+- Regularly rotate the key using a secure secrets manager.
+- Scrutinize any logs for invalid authentication attempts (HTTP 403 or HTTP 401).
+
+### 2. Federated Learning Server Trust
+While Krum protects the server from individual rogue participants, the server remains a centralized point of trust:
+- A compromised server could selectively exclude honest participants to skew $p_{global}$.
+- If the server has a backdoor, it can view client soft labels before Gaussian noise is applied.
+
+**Recommendations**:
+- Coordinate the transition to Secure Multi-Party Computation (SMPC) to ensure the server never receives unaggregated, readable soft labels.
+- Verify server audit logs offline regularly using the server's public key.
+
+### 3. Cross-Chain Bridge Data Trust Model
+
+Bridge messages feed cross-chain fraud features, so a forged message could
+falsely link (or unlink) wallets across chains. Trust rules:
+
+- **Solana / Wormhole VAAs** (`ingestion/solana_adapter.py`, `ingestion/wormhole_vaa.py`):
+  the Solana RPC node is *untrusted*. A VAA is trusted only if it parses
+  strictly as VAA v1 and carries signatures from at least `⌊2n/3⌋ + 1` of the
+  `n` guardians in the **current** guardian set (`WORMHOLE_GUARDIAN_SET_INDEX`,
+  `WORMHOLE_GUARDIAN_ADDRESSES`). Signatures must be over
+  `keccak256(keccak256(body))`, use strictly ascending guardian indices, and
+  recover to the configured guardian address. VAAs from other guardian sets
+  are rejected.
+- **Fail closed**: with no guardian set configured, every VAA is rejected.
+- **Reject and quarantine, never drop silently**: malformed or unverified VAAs
+  are written to the trade DLQ with status `quarantined` (source
+  `solana_wormhole_vaa`), logged as `wormhole.vaa_rejected`, and raise the
+  `TradeDLQPoisonMessageQuarantined` alert (see `docs/runbooks/dlq.md`).
+- **Guardian set rotation** is an operator action: update the settings when
+  Wormhole governance rotates the set. The configured addresses are the root
+  of trust and must come from an authenticated source.
+- **EVM bridge events** (`ingestion/bridge_loader.py`): only finalized blocks
+  (`EVM_CONFIRMATION_DEPTH`) are ingested, reorged data is retracted, and a
+  sample of events is re-verified against transaction receipts
+  (`BRIDGE_VERIFY_SAMPLE_RATE`); see `docs/cross_chain_detection.md`.
+- Parser robustness is covered by `fuzz/fuzz_solana_vaa_parser.py`; malformed
+  inputs it surfaces are kept as permanent regression tests in
+  `tests/test_wormhole_vaa.py`.
+
+---
+
+## Test Coverage Traceability
+
+Every STRIDE threat above is mapped to the automated regression test(s) that
+guard it, or to an explicitly tracked gap, in the
+[STRIDE threat → test matrix](threat_test_matrix.md).
+
+## Maintenance & Review Process
+
+To prevent documentation decay and align the threat model with security updates:
+- **New Threats Require a Test Link**: Adding a STRIDE row to this document requires a matching row in [threat_test_matrix.md](threat_test_matrix.md) (a test reference, or a `gap` tracked in `TODO.md`). CI enforces this via `scripts/check_threat_matrix.py`.
+- **Trigger Check**: Re-evaluate this model on any modifications to trust boundary paths (e.g. changing contract interfaces, webhook schema adjustments, or registering new ingestion protocols).
+- **Scheduled Audit**: Conduct a formal team security review of this threat model **at least once every 6 months**.

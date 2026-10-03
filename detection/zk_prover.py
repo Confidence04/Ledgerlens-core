@@ -36,11 +36,23 @@ NUM_BITS = 7  # 2^7 = 128 >= 100
 # layout change; the Rust side rejects any other version byte.
 PROOF_WIRE_VERSION = 1
 
+# Circuit version identifier embedded in every generated proof. This is
+# distinct from PROOF_WIRE_VERSION: the wire version describes the byte
+# layout, while the circuit version identifies the proving circuit/statement
+# semantics. The on-chain verifier accepts a set of circuit versions during a
+# migration window and rejects any version past its deprecation window.
+#
+# Keep this in sync with the accepted-version set in
+# contracts/zk_verifier/src/lib.rs and the deprecation policy documented in
+# circuits/README.md.
+CIRCUIT_VERSION = 1
+
 # Fixed record size in bytes: 6 x 32-byte big-endian field/scalar elements
 # per bit (commit_x, commit_y, c0, c1, s0, s1).
 _BIT_RECORD_LEN = 6 * 32
-# 1 version byte + 2 x 32-byte score-commitment coordinates + NUM_BITS records.
-PROOF_WIRE_LEN = 1 + 2 * 32 + NUM_BITS * _BIT_RECORD_LEN
+# 1 version byte + 1 circuit-version byte + 2 x 32-byte score-commitment
+# coordinates + NUM_BITS records.
+PROOF_WIRE_LEN = 1 + 1 + 2 * 32 + NUM_BITS * _BIT_RECORD_LEN
 
 
 class ProofError(Exception):
@@ -80,6 +92,7 @@ def _serialize_proof(
     bit_proofs: list[dict[str, int]],
 ) -> dict[str, Any]:
     return {
+        "circuit_version": CIRCUIT_VERSION,
         "score_commit_x": int(score_commit[0]),
         "score_commit_y": int(score_commit[1]),
         "bits": [
@@ -195,6 +208,9 @@ def generate_threshold_proof(
         *commitment_hex* — the SHA-256 commitment to be stored on-chain.
         *score_commit_coords* — ``(x, y)`` of the Pedersen commitment.
         *proof_dict* — the serialised proof for ``verify_threshold_proof``.
+        The dict carries a ``circuit_version`` field so the on-chain verifier
+        can accept multiple concurrently-supported circuit versions during a
+        migration window.
     """
     if not (0 <= score <= MAX_SCORE):
         raise ProofError(f"Score must be 0-{MAX_SCORE}, got {score}")
@@ -222,11 +238,14 @@ def generate_threshold_proof(
     r = sum((1 << i) * r_i_list[i] for i in range(NUM_BITS)) % curve_order
     P = pedersen_commit(score, r)
 
-    # 4. Generate bit proofs — context uses only public values
+    # 4. Generate bit proofs — context uses only public values. The circuit
+    # version is bound into the Fiat-Shamir transcript so a proof generated
+    # under one circuit version cannot be replayed as another.
     p_x_proof, p_y_proof = serialize_point(P)
     context = hashlib.sha256(
         wallet.encode()
         + threshold.to_bytes(1, "big")
+        + CIRCUIT_VERSION.to_bytes(1, "big")
         + p_x_proof.to_bytes(32, "big")
         + p_y_proof.to_bytes(32, "big")
     ).digest()
@@ -253,31 +272,39 @@ def generate_threshold_proof(
 # Nothing previously serialised a proof dict to actual bytes -- the Soroban
 # contract's ``verify_threshold`` takes a raw ``Bytes`` argument, and the
 # only Rust-side deserialiser was an unconditional stub. This defines that
-# missing wire format (versioned, so a future layout change is detectable).
+# missing wire format (versioned, so a future layout change can be detected
+# and rejected rather than silently mis-parsed).
 #
-# Layout (all integers big-endian):
-#   byte 0            : PROOF_WIRE_VERSION
-#   bytes 1..33       : score_commit_x (32)
-#   bytes 33..65      : score_commit_y (32)
+# Layout (big-endian throughout):
+#   byte 0        : PROOF_WIRE_VERSION
+#   byte 1        : CIRCUIT_VERSION
+#   bytes 2..34   : score_commit_x (32 bytes)
+#   bytes 34..66  : score_commit_y (32 bytes)
 #   then NUM_BITS records of _BIT_RECORD_LEN bytes each:
-#     commit_x (32), commit_y (32), c0 (32), c1 (32), s0 (32), s1 (32)
+#     commit_x, commit_y, c0, c1, s0, s1 (each 32 bytes)
+#
+# The circuit version is carried explicitly so the on-chain verifier can
+# accept a set of concurrently-supported versions during a migration window
+# and reject versions past their deprecation window.
 
 def serialize_proof_bytes(proof: dict[str, Any]) -> bytes:
     """Serialise a proof dict into the fixed on-chain wire format."""
+    circuit_version = int(proof.get("circuit_version", CIRCUIT_VERSION))
+    if not (0 <= circuit_version <= 0xFF):
+        raise ProofError(f"circuit_version out of range: {circuit_version}")
+
     out = bytearray()
     out.append(PROOF_WIRE_VERSION)
+    out.append(circuit_version)
     out += int(proof["score_commit_x"]).to_bytes(32, "big")
     out += int(proof["score_commit_y"]).to_bytes(32, "big")
-    bits = proof["bits"]
-    if len(bits) != NUM_BITS:
-        raise ProofError(f"Expected {NUM_BITS} bit records, got {len(bits)}")
-    for rec in bits:
-        out += int(rec["commit_x"]).to_bytes(32, "big")
-        out += int(rec["commit_y"]).to_bytes(32, "big")
-        out += int(rec["c0"]).to_bytes(32, "big")
-        out += int(rec["c1"]).to_bytes(32, "big")
-        out += int(rec["s0"]).to_bytes(32, "big")
-        out += int(rec["s1"]).to_bytes(32, "big")
+    for bit in proof["bits"]:
+        out += int(bit["commit_x"]).to_bytes(32, "big")
+        out += int(bit["commit_y"]).to_bytes(32, "big")
+        out += int(bit["c0"]).to_bytes(32, "big")
+        out += int(bit["c1"]).to_bytes(32, "big")
+        out += int(bit["s0"]).to_bytes(32, "big")
+        out += int(bit["s1"]).to_bytes(32, "big")
     return bytes(out)
 
 
@@ -285,32 +312,35 @@ def deserialize_proof_bytes(data: bytes) -> dict[str, Any]:
     """Parse the fixed on-chain wire format back into a proof dict."""
     if len(data) != PROOF_WIRE_LEN:
         raise ProofError(
-            f"Invalid proof length: expected {PROOF_WIRE_LEN}, got {len(data)}"
+            f"Proof must be {PROOF_WIRE_LEN} bytes, got {len(data)}"
         )
     if data[0] != PROOF_WIRE_VERSION:
-        raise ProofError(
-            f"Unsupported proof wire version: {data[0]} (expected {PROOF_WIRE_VERSION})"
-        )
+        raise ProofError(f"Unsupported proof wire version: {data[0]}")
 
-    def _read(off: int) -> int:
-        return int.from_bytes(data[off : off + 32], "big")
+    circuit_version = data[1]
+    off = 2
+
+    def _take() -> int:
+        nonlocal off
+        val = int.from_bytes(data[off:off + 32], "big")
+        off += 32
+        return val
 
     proof: dict[str, Any] = {
-        "score_commit_x": _read(1),
-        "score_commit_y": _read(33),
+        "circuit_version": circuit_version,
+        "score_commit_x": _take(),
+        "score_commit_y": _take(),
         "bits": [],
     }
-    off = 65
     for _ in range(NUM_BITS):
         proof["bits"].append(
             {
-                "commit_x": _read(off),
-                "commit_y": _read(off + 32),
-                "c0": _read(off + 64),
-                "c1": _read(off + 96),
-                "s0": _read(off + 128),
-                "s1": _read(off + 160),
+                "commit_x": _take(),
+                "commit_y": _take(),
+                "c0": _take(),
+                "c1": _take(),
+                "s0": _take(),
+                "s1": _take(),
             }
         )
-        off += _BIT_RECORD_LEN
     return proof
