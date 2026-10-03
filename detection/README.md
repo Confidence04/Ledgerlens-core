@@ -45,9 +45,9 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 | `ensemble_reweighter.py` | Adjusts per-model ensemble weights at inference time |
 | `adaptive_reweighter.py` | Dynamically reweights ensemble models based on analyst feedback signals |
 | `shadow_scoring.py` | Shadow-mode scoring — runs a candidate model alongside the live model to compare outputs safely before promotion |
-| `drift_monitor.py` | PSI-based feature drift detection; triggers continuous retraining when drift exceeds the configured threshold |
-| `drift_detectors.py` | Pluggable drift detector implementations (PSI, Kolmogorov-Smirnov, and others) |
-| `shap_drift_monitor.py` | Monitors SHAP value distributions for explanation drift, scoped to each model name and version, independent of raw feature drift |
+| `drift_monitor.py` | Pluggable batch distribution tests (PSI, Kolmogorov-Smirnov, and extensions) with per-feature thresholds and drift alerting |
+| `drift_detectors.py` | Common streaming detector interface and registry for per-feature ADWIN, Page-Hinkley, and custom tests |
+| `shap_drift_monitor.py` | Monitors SHAP value distributions for explanation drift, independent of raw feature drift |
 | `mlflow_tracker.py` | MLflow experiment tracking integration — logs parameters, metrics, and artefacts for every training run |
 
 ---
@@ -58,8 +58,8 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 |------|-------------|
 | `gnn_ring_detector.py` | Graph neural network classifier that scores wash-trading ring membership directly from the trade graph |
 | `gnn_model.py` | GNN model architecture (message-passing layers and readout head) |
-| `embedding_store.py` | SQLite-backed store for GNN wallet embeddings with model version and timestamp metadata |
-| `vector_index.py` | FAISS approximate nearest-neighbour index for global similarity search across all stored wallet embeddings |
+| `embedding_store.py` | SQLite-backed store for GNN wallet embeddings with model version, timestamp, and change revision metadata |
+| `vector_index.py` | FAISS approximate nearest-neighbour index for global similarity search; rebuilt immediately when the embedding store revision or model version changes, and periodically as a fallback |
 
 → See [`../docs/gnn_ring_detection.md`](../docs/gnn_ring_detection.md)
 
