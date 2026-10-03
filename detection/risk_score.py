@@ -26,6 +26,13 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
+# ---------------------------------------------------------------------------
+# Aggregation contract version
+# ---------------------------------------------------------------------------
+# Bump this constant (and regenerate tests/score_version_golden.json) whenever
+# the aggregation formula, weights, clamp bounds, or field semantics change.
+SCORE_VERSION: str = "3"
+
 
 class RiskScore(BaseModel):
     wallet: str
@@ -36,6 +43,13 @@ class RiskScore(BaseModel):
     confidence: int = Field(ge=0, le=100)
     disputed: bool = False
     timestamp: datetime
+
+    # Aggregation contract version — propagate unchanged through API responses
+    # and on-chain publications.  See module docstring for the versioned spec.
+    score_version: str = Field(
+        default=SCORE_VERSION,
+        description="Aggregation formula version; bump on any formula change",
+    )
 
     # Streaming latency field (optional, populated on the streaming path)
     latency_ms: float | None = Field(
@@ -126,6 +140,7 @@ class RiskScore(BaseModel):
             ml_flag=ml_flag,
             confidence=round(ml_confidence * 100),
             timestamp=datetime.now(timezone.utc),
+            score_version=SCORE_VERSION,
             score_lower=score_lower,
             score_upper=score_upper,
             prediction_set=prediction_set,
