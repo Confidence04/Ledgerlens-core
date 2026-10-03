@@ -106,6 +106,10 @@ MIN_AUDIT_SECRET_LENGTH = 32
 # ---------------------------------------------------------------------------
 
 
+class InvalidEventSignatureError(ValueError):
+    """Raised when a scoring event reaches the audit log unsigned or tampered."""
+
+
 class AuditSecretError(RuntimeError):
     """Raised when no trustworthy audit-chain signing secret is available.
 
@@ -445,6 +449,29 @@ def log_score_computed(
 ) -> dict:
     """Log a score-computed event."""
     return append_entry("score_computed", actor, wallet=wallet, score=score, db_path=db_path)
+
+
+def ingest_scoring_event(event, db_path: str | None = None) -> dict:
+    """Verify a scoring event's custody signature, then log it.
+
+    ``event`` is an ``audit.scoring_events.ScoringEvent`` or its ``to_dict``
+    form as received from transport. Unsigned or tampered events raise
+    :class:`InvalidEventSignatureError` and are never written.
+    """
+    from audit.scoring_events import ScoringEvent
+
+    if isinstance(event, dict):
+        event = ScoringEvent.from_row(event)
+    if not event.verify_signature():
+        raise InvalidEventSignatureError(
+            f"Rejected scoring event {event.event_id}: missing or invalid signature"
+        )
+    return log_score_computed(
+        event.actor_id or event.triggered_by,
+        event.wallet,
+        event.score,
+        db_path=db_path,
+    )
 
 
 def log_api_key_used(

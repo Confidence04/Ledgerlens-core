@@ -100,6 +100,24 @@ Links Stellar wallets to their EVM counterparts and computes EVM-side trading st
 - `score_hypothesis(stellar_wallet, evm_wallet, bridge_events)` — compute Bayesian confidence score for the link hypothesis (returns `WalletLinkHypothesis`)
 - `persist_hypothesis(hypothesis)` — persist accepted hypotheses (confidence >= 0.7) to SQLite
 - `get_accepted_links(stellar_wallet, min_confidence=None)` — retrieve accepted link hypotheses sorted by confidence descending
+- `link_confidences(stellar_wallet, lookback_days=90)` — `{evm_wallet: confidence}` for every bridged EVM wallet, instead of a binary linked/not-linked list
+- `fit_calibration(llrs, labels)` — fit Platt scaling on labeled true/false link pairs
+
+#### Confidence-scoring methodology
+
+Each hypothesis sums log-likelihood ratios from four evidence features (timing
+similarity, amount match, direction consistency, address pattern). Because
+those features are not truly independent, the raw posterior `sigmoid(llr)` is
+over-confident. `confidence` is therefore Platt-scaled:
+`sigmoid(a * llr + b)`, with `(a, b)` fitted by logistic regression on a
+labeled set of known true and false cross-chain link pairs
+(`CrossChainLinker(calibration=(a, b))` to apply a fitted pair). Calibration
+is validated by expected calibration error and Brier score on a held-out
+labeled set (`tests/test_cross_chain_confidence.py`).
+
+Downstream, `cross_chain_round_trip_score` is multiplied by the wallet's
+highest link confidence, so round trips through weak links count for less than
+round trips through confirmed ones.
 
 ## Seven Cross-Chain Features
 
@@ -113,7 +131,7 @@ These features are appended to the end of `FEATURE_NAMES` (backward-compatible; 
 | `evm_counterparty_concentration` | HHI of counterparty addresses in EVM trades (0=diverse, 1=monopoly) | High = trading with very few counterparties |
 | `bridge_volume_ratio` | EVM bridge volume / (Stellar SDEX volume + EVM bridge volume) | High = activity concentrated on bridge |
 | `cross_chain_time_lag_median_h` | Median hours between paired EVM and Stellar trades | Very low = near-instant round-trips |
-| `cross_chain_round_trip_score` | Correlation score (0–1) for Stellar→EVM→Stellar round-trip bridge patterns based on amount similarity (within 5%), timing proximity (within 24h), and intermediate hops | High = strong evidence of multi-network wash cycles |
+| `cross_chain_round_trip_score` | Correlation score (0–1) for Stellar→EVM→Stellar round-trip bridge patterns based on amount similarity (within 5%), timing proximity (within 24h), and intermediate hops, weighted by the highest calibrated link confidence | High = strong evidence of multi-network wash cycles |
 
 ## API Changes
 
