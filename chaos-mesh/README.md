@@ -35,11 +35,13 @@ in the `ledgerlens` namespace by `app.kubernetes.io/*` labels.
    The `pod-kill-*` experiments run on a cron (`@every 10m`); the
    `network-partition-*` experiments run once for their `duration` (60s).
 
-3. **Verify** — once the experiment's `duration` has elapsed, confirm recovery:
+3. **Verify** — run immediately after applying, so sustained traffic flows
+   through the fault; the script asserts the experiment's SLOs:
 
    ```bash
    # Against a real target (Kubernetes-hosted staging, port-forward, etc.)
-   python chaos-mesh/verify_experiment.py --health-url https://ledgerlens.staging.example/health
+   python chaos-mesh/verify_experiment.py --experiment pod-kill-api.yaml \
+     --url https://ledgerlens.staging.example
 
    # Local default: http://localhost:8000/health
    python chaos-mesh/verify_experiment.py
@@ -51,21 +53,77 @@ in the `ledgerlens` namespace by `app.kubernetes.io/*` labels.
    kubectl delete -f chaos-mesh/pod-kill-api.yaml
    ```
 
-## `verify_experiment.py`
+## SLO pass/fail criteria
 
-Polls `GET /health` every 2 seconds until it returns HTTP 200 with
-`{"status": "ok"}`, or until the timeout elapses.
+`verify_experiment.py` drives sustained traffic (4 concurrent clients) for the
+traffic window while polling `GET /health`, then fails (exit `1`) if any
+criterion below is violated. The criteria live in `EXPERIMENT_SLOS` in the
+script — keep this table in sync.
+
+| Experiment | Recovery ≤ | Error-rate ceiling | Silently dropped | Drain budget | Traffic window |
+| --- | --- | --- | --- | --- | --- |
+| `pod-kill-api.yaml` | 60s | 5% | 0 | 30s | 60s |
+| `pod-kill-ingestion.yaml` | 90s | 1% | 0 | 30s | 60s |
+| `network-partition-ingestion.yaml` | 60s | 5% | 0 | 10s | 90s |
+| `network-partition-redis.yaml` | 60s | 2% | 0 | 10s | 90s |
+
+Each traffic request is classified as:
+
+- **ok** — HTTP < 400;
+- **retriable** — HTTP 429/502/503/504, or the connection was refused / timed
+  out before the request was sent (a client can safely retry);
+- **dropped** — anything else: connection reset or read timeout after the
+  request was sent, or a non-retriable error status. This is a *silently
+  dropped* request.
+
+- **Recovery** — seconds until `/health` returns 200 `{"status": "ok"}`.
+- **Error rate** — `(retriable + dropped) / total`.
+- **Drain time** — latency of the slowest request that still completed during
+  the window, i.e. how long in-flight work took to drain. Exceeding the budget
+  logs an `ALERT chaos drain budget exceeded` line and, if `--alert-webhook`
+  (`CHAOS_ALERT_WEBHOOK`) is set, POSTs `{"alert": "ChaosDrainBudgetExceeded", ...}`.
 
 | Option | Env var | Default | Purpose |
 | --- | --- | --- | --- |
+| `--experiment` | `CHAOS_EXPERIMENT` | `pod-kill-api.yaml` | Experiment whose SLOs to assert. |
+| `--url` | — | — | API base URL; health URL becomes `<url>/health`. |
 | `--health-url` | `HEALTH_URL` | `http://localhost:8000/health` | Health endpoint to poll. |
 | `--timeout` | `HEALTH_TIMEOUT_S` | `60` | Seconds to keep polling before failing. |
 | `--expect-degraded CIRCUIT` | — | off | While the fault is active, assert `/health` reports graceful degraded mode for `CIRCUIT` (see below), then assert it closes again on recovery. |
 | `-v` / `--verbose` | — | off | Log every failed poll attempt at DEBUG. |
 
-Exit code `0` means the endpoint recovered within the timeout; `1` means it did
-not. Connection errors during polling are expected while a fault is active and
-are logged at DEBUG rather than aborting the run.
+The `chaos-staging.yml` workflow runs the script after injecting the
+experiment, so an SLO violation fails the CI job.
+
+## Graceful-shutdown contract (API)
+
+On `SIGTERM` (e.g. a pod kill) the API (`api/main.py` lifespan):
+
+1. Stops accepting new work — every non-`/health*` request gets
+   `503 Server is shutting down.` with `Retry-After: 5` (retriable).
+2. Drains in-flight requests for up to `SHUTDOWN_TIMEOUT` seconds (default 30),
+   then closes WebSockets, checkpoints SQLite and closes Redis.
+3. Logs `[shutdown] drain_seconds=<n>`; if draining exceeds
+   `SHUTDOWN_DRAIN_BUDGET_S` (default 25) it logs
+   `[shutdown] ALERT drain time ... exceeded budget ...` at WARNING for
+   log-based alerting.
+
+Clients therefore see every request either complete or receive a retriable
+error — never a silently dropped response. `pod-kill-api.yaml` verifies this
+with zero tolerance for dropped requests. The pod's
+`terminationGracePeriodSeconds` must exceed `SHUTDOWN_TIMEOUT`.
+
+## Toxiproxy profiles (local chaos suite)
+
+`toxiproxy.json` defines the proxies used by `tests/chaos/` (`make test-chaos`):
+
+| Proxy | Listen | Upstream | Profiles / documented degraded behaviour |
+| --- | --- | --- | --- |
+| `horizon_proxy` | `:18000` | Horizon | 500ms latency — scoring p99 stays < 2s. |
+| `horizon_partition` | `:18001` | Horizon | Partition — circuit breaker opens. |
+| `redis_proxy` | `:16379` | Redis | Outage — cache fallback path. |
+| `soroban_rpc_proxy` | `:18002` | Soroban RPC (testnet) | 3s±1s latency spike, 2s timeout, connection reset (proxy disabled) — `integrations/contract_client.py` submissions fail with `SorobanSubmissionError` within a bounded time, and after the breaker threshold further submissions fail fast with `SorobanCircuitOpenError` (`test_soroban_rpc_degradation.py`). |
+| `oracle_node_proxy` | `:18003` | oracle-node stand-in (Redis PING) | 500ms latency — quorum still reached; full timeout — `detection/oracle_coordinator.py` reports an invalid quorum within a bounded time and does not submit; partial outage — quorum reached from healthy nodes (`test_oracle_degradation.py`). |
 
 ## Feature-store degraded-mode contract
 
