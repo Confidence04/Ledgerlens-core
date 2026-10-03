@@ -2,7 +2,7 @@
 
 Endpoint: GET /ws/alerts?api_key=<key>[&wallet_filter=G...]
 
-Authentication: api_key query param compared against settings.admin_api_key.
+Authentication: api_key query param, enforced via api.policy (admin scope).
 Heartbeat: ping every 30s; connection dropped if no pong within 60s.
 Re-authorization: every settings.stream_auth_recheck_interval_seconds (env var
 LEDGERLENS_STREAM_AUTH_RECHECK_INTERVAL_SECONDS, default 30s) the connection's
@@ -15,13 +15,13 @@ Max connections: settings.ws_max_connections (env var LEDGERLENS_WS_MAX_CONNECTI
 
 import asyncio
 import logging
-import secrets
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
+from api import policy
 from config.settings import settings
 from detection.risk_score import RiskScore
 
@@ -29,6 +29,7 @@ logger = logging.getLogger("ledgerlens.ws")
 
 _HEARTBEAT_INTERVAL = 30  # seconds
 _PONG_TIMEOUT = 60         # seconds without pong → drop
+_WS_REQUIRED_SCOPE = "admin"
 
 
 @dataclass
