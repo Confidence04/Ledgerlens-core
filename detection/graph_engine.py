@@ -16,6 +16,10 @@ from scipy.sparse import csr_matrix, lil_matrix
 
 logger = logging.getLogger(__name__)
 
+RING_APPROX_THRESHOLD_ENV = "LEDGERLENS_RING_APPROX_THRESHOLD"
+RING_APPROX_BUDGET_ENV = "LEDGERLENS_RING_APPROX_SAMPLE_NODES"
+_RANDOM_WALK_LENGTH = 32
+
 
 def build_transaction_graph(trades: pd.DataFrame) -> nx.DiGraph:
     """Build a directed graph from a trades DataFrame.
@@ -143,12 +147,42 @@ def find_wash_rings(
     min_ring_size: int = 3,
     max_ring_size: int = 10,
     min_cycle_volume: float = 0.0,
+    approximation_threshold: Optional[int] = None,
+    sample_node_budget: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> list[dict]:
-    """Find candidate wash rings using Tarjan's SCC algorithm."""
+    """Find candidate wash rings using Tarjan's SCC algorithm.
+
+    When the graph has more than ``approximation_threshold`` nodes (default:
+    ``LEDGERLENS_RING_APPROX_THRESHOLD`` env var, disabled when unset), the
+    search runs on a bounded random-walk sample of at most
+    ``sample_node_budget`` nodes instead of the full graph. Every ring
+    produced this way carries ``"approximate": True`` so downstream consumers
+    know it came from degraded-precision mode. See ``docs/ring_approximation.md``.
+    """
     if min_ring_size < 1:
         raise ValueError("min_ring_size must be at least 1")
     if max_ring_size < min_ring_size:
         raise ValueError("max_ring_size must be greater than or equal to min_ring_size")
+
+    if approximation_threshold is None:
+        env_threshold = os.environ.get(RING_APPROX_THRESHOLD_ENV)
+        approximation_threshold = int(env_threshold) if env_threshold else None
+    approximate = (
+        approximation_threshold is not None and graph.number_of_nodes() > approximation_threshold
+    )
+    if approximate:
+        budget = sample_node_budget or int(
+            os.environ.get(RING_APPROX_BUDGET_ENV, approximation_threshold)
+        )
+        logger.warning(
+            "Ring detection running in approximation mode: graph has %d nodes (threshold %d), "
+            "sampling %d nodes via bounded random walks",
+            graph.number_of_nodes(),
+            approximation_threshold,
+            budget,
+        )
+        graph = graph.subgraph(_random_walk_sample(graph, budget, seed))
 
     rings: list[dict[str, Any]] = []
     for component in nx.strongly_connected_components(graph):
@@ -177,6 +211,7 @@ def find_wash_rings(
                     "avg_trade_count": avg_trade_count,
                     "timing_tightness": timing_tightness,
                     "truncated": True,
+                    "approximate": approximate,
                 }
             )
             continue
@@ -193,10 +228,40 @@ def find_wash_rings(
                 "avg_trade_count": avg_trade_count,
                 "timing_tightness": timing_tightness,
                 "truncated": False,
+                "approximate": approximate,
             }
         )
 
     return sorted(rings, key=lambda ring: (ring["total_volume"], ring["cycle_volume"]), reverse=True)
+
+
+def _random_walk_sample(graph: nx.DiGraph, node_budget: int, seed: Optional[int]) -> set:
+    """Collect up to ``node_budget`` nodes via bounded random walks along out-edges.
+
+    Walks start from nodes chosen with probability proportional to out-degree,
+    so dense trading clusters (where rings live) are favoured, and follow
+    directed edges so closed cycles tend to be captured whole.
+    """
+    rng = np.random.default_rng(seed)
+    nodes = list(graph.nodes)
+    if node_budget >= len(nodes):
+        return set(nodes)
+    weights = np.array([graph.out_degree(n) + 1 for n in nodes], dtype=float)
+    weights /= weights.sum()
+    sampled: set = set()
+    for start in rng.choice(len(nodes), size=node_budget * 4, p=weights):
+        if len(sampled) >= node_budget:
+            break
+        current = nodes[start]
+        for _ in range(_RANDOM_WALK_LENGTH):
+            sampled.add(current)
+            if len(sampled) >= node_budget:
+                break
+            successors = list(graph.successors(current))
+            if not successors:
+                break
+            current = successors[rng.integers(len(successors))]
+    return sampled
 
 
 def build_ring_membership_index(
@@ -229,6 +294,7 @@ def build_ring_membership_index(
                 "timing_tightness": timing_tightness,
                 "timing_tightness_score": timing_tightness_score,
                 "truncated": bool(ring.get("truncated", False)),
+                "approximate": bool(ring.get("approximate", False)),
             }
             current = membership.get(account)
             if current is None or _ring_metadata_precedes(metadata, current):
@@ -917,6 +983,7 @@ class TradeGraph:
                 "timing_tightness": timing_tightness,
                 "timing_tightness_score": timing_tightness_score,
                 "truncated": bool(ring.get("truncated", False)),
+                "approximate": bool(ring.get("approximate", False)),
             }
             if best is None or _ring_metadata_precedes(metadata, best):
                 best = metadata
