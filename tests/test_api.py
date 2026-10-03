@@ -637,6 +637,12 @@ def test_asset_risk_ranking(client):
     assert body[0]["asset_pair"] == "XLM/USDC"
     assert body[0]["average_score"] == 60.0
     assert body[0]["wallet_count"] == 2
+    assert response.headers["X-Cache"] == "MISS"
+
+    cached = client.get("/v1/assets/risk-ranking")
+    assert cached.headers["X-Cache"] == "HIT"
+    assert float(cached.headers["X-Cache-Age"]) >= 0.0
+    assert cached.json() == body
 
 
 # ---------------------------------------------------------------------------

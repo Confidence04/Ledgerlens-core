@@ -180,3 +180,28 @@ See [docs/contract_fuzzing.md](../docs/contract_fuzzing.md) for:
 - Security considerations
 - Corpus management
 - Complete troubleshooting guide
+
+## Contract Test Vectors
+
+`tests/fixtures/contract_vectors.json` is generated from the canonical Python
+models (`detection/risk_score.py`, `ingestion/data_models.py`) and consumed by
+the Python, Rust, and TypeScript SDK contract tests. The `contract-vectors` job
+in `.github/workflows/schema.yml` regenerates it on every PR and push to `main`
+and **fails if the result differs from the committed file** — so a change to
+contract behaviour cannot merge without regenerated vectors.
+
+To intentionally update the vectors:
+
+```bash
+python scripts/generate_contract_vectors.py      # regenerate the fixture
+git diff tests/fixtures/contract_vectors.json    # review what changed
+python scripts/check_contract_vectors.py         # field-level drift report
+pytest tests/test_contract_vectors.py            # Python round-trip tests
+```
+
+Then update any affected SDK (`sdk/src/schemas.ts`,
+`crates/ledgerlens-sdk/src/models.rs`,
+`packages/ledgerlens-sdk/src/ledgerlens/models.py`,
+`proto/ledgerlens/v1/scoring.proto`) and commit the fixture in the same PR.
+Never hand-edit the fixture; CI will reject anything the generator does not
+reproduce exactly.

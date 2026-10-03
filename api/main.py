@@ -44,6 +44,7 @@ from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
 from api.namespace import list_namespaces
 from api.gateway import GatewayMiddleware
+from api.score_cache import aggregate_cache
 from config.settings import get_runtime_risk_score_threshold, settings
 from detection.tracing import (
     TRACE_ID_HEADER,
@@ -1391,18 +1392,29 @@ def alerts(
     summary="Asset pair risk ranking",
     description="Return each asset pair ranked by average wallet risk score, descending.",
 )
-def asset_risk_ranking() -> list[dict]:
-    """Return each asset pair ranked by its average wallet risk score (descending)."""
-    scores = get_latest_scores()
-    by_pair: dict[str, list[int]] = defaultdict(list)
-    for s in scores:
-        by_pair[s.asset_pair].append(s.score)
+def asset_risk_ranking(response: Response) -> list[dict]:
+    """Return each asset pair ranked by its average wallet risk score (descending).
 
-    ranking = [
-        {"asset_pair": pair, "average_score": round(sum(values) / len(values), 2), "wallet_count": len(values)}
-        for pair, values in by_pair.items()
-    ]
-    return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+    Served from ``aggregate_cache``; a newly written score invalidates it.
+    ``X-Cache`` (``HIT``/``MISS``) and ``X-Cache-Age`` (seconds) expose freshness.
+    """
+
+    def compute() -> list[dict]:
+        scores = get_latest_scores()
+        by_pair: dict[str, list[int]] = defaultdict(list)
+        for s in scores:
+            by_pair[s.asset_pair].append(s.score)
+
+        ranking = [
+            {"asset_pair": pair, "average_score": round(sum(values) / len(values), 2), "wallet_count": len(values)}
+            for pair, values in by_pair.items()
+        ]
+        return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+
+    result = aggregate_cache.get_or_compute("assets:risk-ranking", compute)
+    response.headers["X-Cache"] = "HIT" if result.hit else "MISS"
+    response.headers["X-Cache-Age"] = f"{result.age_seconds:.3f}"
+    return result.value
 
 
 @v1_router.get(
