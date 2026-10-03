@@ -288,6 +288,14 @@ class Settings(BaseSettings):
     # falls back to plain weighted FedAvg with no per-round peer-distance
     # defense (the cosine heuristic still applies if enabled).
     federated_use_krum: bool = True
+    # Final aggregation rule applied to the (Krum-filtered) updates:
+    #   "fedavg"       -- sample-weighted average (fastest convergence, no
+    #                     per-coordinate Byzantine tolerance)
+    #   "trimmed_mean" -- coordinate-wise trimmed mean; tolerates fewer than
+    #                     `federated_trim_fraction` of participants poisoning
+    #                     any coordinate. See docs/byzantine_resilience.md.
+    federated_aggregation_strategy: str = "fedavg"
+    federated_trim_fraction: float = 0.2
 
     # ── Cross-chain Bayesian linking ─────────────────────────────────────────
     cross_chain_timing_sigma_seconds: float = 300.0
