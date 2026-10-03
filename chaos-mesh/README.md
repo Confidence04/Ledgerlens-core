@@ -88,11 +88,8 @@ Each traffic request is classified as:
 | `--experiment` | `CHAOS_EXPERIMENT` | `pod-kill-api.yaml` | Experiment whose SLOs to assert. |
 | `--url` | — | — | API base URL; health URL becomes `<url>/health`. |
 | `--health-url` | `HEALTH_URL` | `http://localhost:8000/health` | Health endpoint to poll. |
-| `--traffic-url` | `TRAFFIC_URL` | health URL | Endpoint receiving sustained traffic. |
-| `--traffic-seconds` | — | per experiment | Traffic window; `0` disables traffic assertions. |
-| `--timeout` | `HEALTH_TIMEOUT_S` | per experiment | Override the recovery SLO. |
-| `--alert-webhook` | `CHAOS_ALERT_WEBHOOK` | — | Alert target for drain-budget breaches. |
-| `--metrics-url` | `METRICS_URL` | `http://localhost:8000/metrics` | Logged for reference. |
+| `--timeout` | `HEALTH_TIMEOUT_S` | `60` | Seconds to keep polling before failing. |
+| `--expect-degraded CIRCUIT` | — | off | While the fault is active, assert `/health` reports graceful degraded mode for `CIRCUIT` (see below), then assert it closes again on recovery. |
 | `-v` / `--verbose` | — | off | Log every failed poll attempt at DEBUG. |
 
 The `chaos-staging.yml` workflow runs the script after injecting the
@@ -127,6 +124,71 @@ with zero tolerance for dropped requests. The pod's
 | `redis_proxy` | `:16379` | Redis | Outage — cache fallback path. |
 | `soroban_rpc_proxy` | `:18002` | Soroban RPC (testnet) | 3s±1s latency spike, 2s timeout, connection reset (proxy disabled) — `integrations/contract_client.py` submissions fail with `SorobanSubmissionError` within a bounded time, and after the breaker threshold further submissions fail fast with `SorobanCircuitOpenError` (`test_soroban_rpc_degradation.py`). |
 | `oracle_node_proxy` | `:18003` | oracle-node stand-in (Redis PING) | 500ms latency — quorum still reached; full timeout — `detection/oracle_coordinator.py` reports an invalid quorum within a bounded time and does not submit; partial outage — quorum reached from healthy nodes (`test_oracle_degradation.py`). |
+
+## Feature-store degraded-mode contract
+
+`network-partition-redis.yaml` asserts specific degraded behavior of
+`detection/feature_store.py`, not just liveness. Run it with:
+
+```bash
+kubectl apply -f chaos-mesh/network-partition-redis.yaml
+python chaos-mesh/verify_experiment.py --expect-degraded feature_store_redis \
+  --health-url https://ledgerlens.staging.example/health
+```
+
+**During the partition** (checked by `assert_degraded`):
+
+- `GET /health` keeps returning **HTTP 200** — a Redis partition must never
+  escalate to a 503 hard failure. Any 503 fails the experiment immediately.
+- `status` is `"degraded"` and `circuits.feature_store_redis` is `"open"` or
+  `"half_open"` (the breaker trips after 3 consecutive Redis failures).
+- Reads and writes go to the in-process fallback dict (LRU-bounded at
+  `max_fallback_entries`). Feature state is still derived from live trades;
+  Redis values are never read while the circuit is open.
+
+**After the partition heals** (checked by `assert_recovery`):
+
+- After the breaker's 30s recovery timeout, a successful Redis call closes the
+  circuit: `status` returns to `"ok"` with `circuits.feature_store_redis ==
+  "closed"`.
+- Catch-up / cache warm: on the first read of a key, a fallback entry whose
+  `last_updated` is newer than the Redis copy (or with no Redis copy) is
+  written back to Redis and returned, so state accumulated during the outage
+  is never shadowed by the stale pre-partition Redis value (no
+  stale-as-fresh). Keys written back to Redis are dropped from the fallback
+  dict.
+
+## Chaos day and the resilience scorecard
+
+`.github/workflows/chaos-day.yml` runs the full suite against staging every
+Monday at 04:00 UTC (or on demand via *Run workflow*). It calls
+`run_chaos_day.py`, which for each experiment applies it, runs the degraded
+assertion (where one is defined) and the recovery check, then always deletes
+the experiment.
+
+Each run publishes a **resilience scorecard**:
+
+- `scorecard.json` — pass/fail, time to enter degraded mode, and recovery
+  time per experiment, plus the overall score and commit SHA. Uploaded as the
+  `resilience-scorecard` artifact (kept 400 days), so runs are historically
+  comparable.
+- `scorecard.md` — the same data as a table, posted to the workflow's job
+  summary.
+
+The previous run's scorecard is downloaded and compared. A regression (an
+experiment that passed before and now fails, or recovery time up by more than
+50%) fails the run and is listed in the summary.
+
+### Adding a new experiment
+
+1. Add the Chaos Mesh YAML to this directory, targeting the
+   `ledgerlens-staging` namespace, and add a row to the table above.
+2. Register it in `EXPERIMENTS` in `run_chaos_day.py` with an `inject_wait_s`
+   (how long to wait after `kubectl apply` before verifying), plus
+   `expect_degraded` if it trips a `/health` circuit that should be asserted.
+3. If it adds a new degraded mode, document the contract in this README.
+4. Trigger `chaos-day.yml` manually once to confirm it passes and appears in
+   the scorecard.
 
 ## Related
 

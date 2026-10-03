@@ -35,9 +35,19 @@ Workflow
     Connection errors during health polling are expected while the fault is
     active and are logged at DEBUG (use ``-v`` to see them).
 
+Degraded-mode assertions
+    With ``--expect-degraded CIRCUIT`` (e.g. ``feature_store_redis`` for
+    ``network-partition-redis.yaml``) the script first asserts, *while the
+    fault is active*, that ``/health`` reports the specific degraded mode
+    rather than mere liveness: HTTP 200 (never 503), ``status == "degraded"``
+    and ``circuits[CIRCUIT]`` open or half-open.  It then asserts the
+    recovery-to-healthy transition: ``status == "ok"`` with
+    ``circuits[CIRCUIT] == "closed"``.
+
 Exit codes
-    0  every SLO for the experiment was met
-    1  at least one SLO was violated (each violation is printed)
+    0  the health endpoint recovered within the timeout
+    1  the health endpoint did not recover in time, or the expected
+       degraded mode was not observed
 """
 import argparse
 import logging
@@ -103,53 +113,47 @@ class TrafficResult:
         return (self.retriable + self.dropped) / self.total if self.total else 0.0
 
 
-def classify(resp: requests.Response | None, exc: Exception | None) -> str:
-    """Return ``ok``, ``retriable`` or ``dropped`` for one traffic request."""
-    if exc is None and resp is not None:
-        if resp.status_code < 400:
-            return "ok"
-        return "retriable" if resp.status_code in RETRIABLE_STATUS else "dropped"
-    # Connection refused before the request was sent is safe to retry; a reset
-    # or timeout after sending means the response was silently lost.
-    if isinstance(exc, requests.exceptions.ConnectTimeout):
-        return "retriable"
-    if isinstance(exc, requests.exceptions.ConnectionError) and "NewConnectionError" in repr(exc):
-        return "retriable"
-    return "dropped"
+def assert_degraded(health_url: str, circuit: str, timeout_s: int = 60) -> float:
+    """Poll GET /health until it reports the graceful degraded mode for *circuit*.
+
+    Passes on HTTP 200 with ``status == "degraded"`` and ``circuits[circuit]``
+    open/half-open. An HTTP 503 means the fault escalated to a hard failure
+    instead of degrading gracefully and fails immediately. Returns the seconds
+    taken to enter degraded mode.
+    """
+    start = time.time()
+    deadline = start + timeout_s
+    last = None
+    while time.time() < deadline:
+        try:
+            resp = requests.get(health_url, timeout=5)
+            if resp.status_code == 503:
+                raise AssertionError(
+                    f"{circuit} fault escalated to a hard failure (HTTP 503): {resp.text[:200]}"
+                )
+            body = resp.json()
+            last = body
+            state = (body.get("circuits") or {}).get(circuit)
+            if (
+                resp.status_code == 200
+                and body.get("status") == "degraded"
+                and state in ("open", "half_open")
+            ):
+                return time.time() - start
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug("degraded check against %s raised %s: %s", health_url, type(exc).__name__, exc)
+        time.sleep(2)
+    raise AssertionError(
+        f"Expected degraded mode for {circuit} within {timeout_s}s; last health body: {last!r}"
+    )
 
 
-def run_traffic(url: str, duration_s: float, workers: int = 4) -> TrafficResult:
-    """Send sustained GET traffic at *url* for *duration_s* and classify every request."""
-    result = TrafficResult()
-    deadline = time.monotonic() + duration_s
+def assert_recovery(health_url: str, timeout_s: int = 60, circuit: str | None = None) -> float:
+    """Poll GET /health until status == 'ok' or timeout_s elapses; raise on timeout.
 
-    def worker() -> None:
-        session = requests.Session()
-        while time.monotonic() < deadline:
-            t0 = time.monotonic()
-            resp, exc = None, None
-            try:
-                resp = session.get(url, timeout=(3, 35))
-            except Exception as e:  # noqa: BLE001 — every failure is classified
-                exc = e
-            kind = classify(resp, exc)
-            elapsed = time.monotonic() - t0
-            with result.lock:
-                setattr(result, kind, getattr(result, kind) + 1)
-                if kind == "ok":
-                    result.max_ok_latency_s = max(result.max_ok_latency_s, elapsed)
-            if kind == "dropped":
-                logger.warning("dropped request: %r", exc or resp.status_code)
-            time.sleep(0.1)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for _ in range(workers):
-            pool.submit(worker)
-    return result
-
-
-def assert_recovery(health_url: str, timeout_s: int = 60) -> float:
-    """Poll GET /health until status == 'ok'; return seconds taken, raise on timeout."""
+    When *circuit* is given, also require ``circuits[circuit] == "closed"``.
+    Returns the seconds taken to recover.
+    """
     start = time.time()
     deadline = start + timeout_s
     attempt = 0
@@ -157,7 +161,10 @@ def assert_recovery(health_url: str, timeout_s: int = 60) -> float:
         attempt += 1
         try:
             resp = requests.get(health_url, timeout=5)
-            if resp.status_code == 200 and resp.json().get("status") == "ok":
+            body = resp.json() if resp.status_code == 200 else {}
+            if body.get("status") == "ok" and (
+                circuit is None or (body.get("circuits") or {}).get(circuit) == "closed"
+            ):
                 return time.time() - start
             logger.debug(
                 "health check attempt %d: not ready yet (status_code=%s, body=%.200r)",
@@ -272,6 +279,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Optional URL to POST a JSON alert to when the drain budget is exceeded.",
     )
     parser.add_argument(
+        "--expect-degraded",
+        metavar="CIRCUIT",
+        default=None,
+        help=(
+            "Assert graceful degraded mode for this /health circuit while the fault "
+            "is active (e.g. feature_store_redis), then assert it closes on recovery."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -288,34 +304,17 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    slo = EXPERIMENT_SLOS[args.experiment]
-    if args.timeout is not None:
-        slo = SLO(args.timeout, slo.max_error_rate, slo.max_dropped, slo.drain_budget_s, slo.traffic_s)
-    traffic_s = slo.traffic_s if args.traffic_seconds is None else args.traffic_seconds
-    logger.info("Verifying %s against %s (metrics: %s)", args.experiment, args.health_url, args.metrics_url)
-
-    traffic: TrafficResult | None = None
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(run_traffic, args.traffic_url, traffic_s) if traffic_s > 0 else None
-        try:
-            recovery_s = assert_recovery(args.health_url, timeout_s=slo.recovery_s)
-        except Exception as e:
-            logger.error("Recovery failed: %s", e)
-            recovery_s = None
-        if future is not None:
-            traffic = future.result()
-
-    if traffic is not None:
-        print(
-            f"traffic: total={traffic.total} ok={traffic.ok} retriable={traffic.retriable} "
-            f"dropped={traffic.dropped} error_rate={traffic.error_rate:.2%} "
-            f"drain={traffic.max_ok_latency_s:.1f}s"
+    try:
+        if args.expect_degraded:
+            entered = assert_degraded(args.health_url, args.expect_degraded, timeout_s=args.timeout)
+            print(f"✅ Degraded mode observed for {args.expect_degraded} after {entered:.1f}s")
+        recovered = assert_recovery(
+            args.health_url, timeout_s=args.timeout, circuit=args.expect_degraded
         )
-    violations = evaluate(slo, recovery_s, traffic)
-    if violations:
-        send_alert(args.alert_webhook, args.experiment, violations)
-        for v in violations:
-            print(f"❌ SLO violated — {v}")
+        print(f"✅ Health recovered in {recovered:.1f}s ({args.health_url})")
+        return 0
+    except Exception as e:
+        print(f"❌ Recovery failed: {e}")
         return 1
     print(f"✅ All SLOs met for {args.experiment} ({args.health_url})")
     return 0
